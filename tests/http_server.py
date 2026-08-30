@@ -95,24 +95,30 @@ class Handler(BaseHTTPRequestHandler):
             if self.command in ("GET", "HEAD"):
                 if not os.path.exists(target):
                     return self._send(404, b"not found")
-                data = open(target, "rb").read()
+                total = os.path.getsize(target)
                 rng = self.headers.get("Range")
                 if rng and rng.startswith("bytes="):
+                    # Seek rather than read-then-slice: the benchmark issues
+                    # hundreds of range requests against a 100 MB file, and a
+                    # server that read it whole each time would be measuring
+                    # itself.
                     spec = rng[len("bytes="):]
                     if spec.startswith("-"):
-                        chunk = data[-int(spec[1:]):]
-                        start = len(data) - len(chunk)
-                        end = len(data) - 1
+                        n = min(int(spec[1:]), total)
+                        start = total - n
+                        end = total - 1
                     else:
                         lo, _, hi = spec.partition("-")
                         start = int(lo)
-                        end = int(hi) if hi else len(data) - 1
-                        end = min(end, len(data) - 1)
-                        chunk = data[start:end + 1]
+                        end = min(int(hi), total - 1) if hi else total - 1
+                    with open(target, "rb") as fh:
+                        fh.seek(start)
+                        chunk = fh.read(end - start + 1)
                     return self._send(206, chunk, extra={
-                        "Content-Range": "bytes %d-%d/%d" % (start, end, len(data)),
+                        "Content-Range": "bytes %d-%d/%d" % (start, end, total),
                         "Accept-Ranges": "bytes",
                     })
+                data = open(target, "rb").read()
                 return self._send(200, data, extra={"Accept-Ranges": "bytes"})
 
             if self.command == "PUT":

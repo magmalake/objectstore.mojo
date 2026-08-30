@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        env: [default, stable]
+    steps:
+      - uses: actions/checkout@v4
+
+      # MinIO is the only S3 server that actually verifies SigV4 signatures,
+      # which is the whole point of the end-to-end tests. It is one static
+      # binary, so no service container is needed; the test runner falls back
+      # to moto and then to skipping if this step does not produce one.
+      - name: Fetch MinIO
+        continue-on-error: true
+        run: |
+          mkdir -p build
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64)  URL=https://dl.min.io/server/minio/release/linux-amd64/minio ;;
+            Linux/aarch64) URL=https://dl.min.io/server/minio/release/linux-arm64/minio ;;
+            Darwin/arm64)  URL=https://dl.min.io/server/minio/release/darwin-arm64/minio ;;
+            Darwin/x86_64) URL=https://dl.min.io/server/minio/release/darwin-amd64/minio ;;
+            *) echo "no MinIO build for this platform"; exit 0 ;;
+          esac
+          curl -sSLf -o build/minio "$URL" && chmod +x build/minio
+          ./build/minio --version
+
+      - uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          # 0.78 rehashes source dependencies and then declares the lock file
+          # out of date; pin the version the lock was solved with.
+          pixi-version: v0.71.1
+          environments: ${{ matrix.env }}
+
+      - name: Unit tests and CLI build
+        run: pixi run -e ${{ matrix.env }} check
+
+      - name: CLI smoke
+        run: |
+          ./build/objectstore-mojo version
+          ./build/objectstore-mojo stat file://$PWD/LICENSE
+          ./build/objectstore-mojo head file://$PWD/NOTICE 40
+          ./build/objectstore-mojo ls file://$PWD/shim
