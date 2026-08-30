@@ -1,0 +1,10 @@
+[package]
+name = "objectstore-shim"
+version = "0.1.0"
+description = "C FFI shim for objectstore-mojo: libobjectstoremojo.so over libcurl, dlopened at runtime"
+
+[package.build]
+backend = { name = "pixi-build-cmake", version = "*" }
+
+[package.host-dependencies]
+libcurl = ">=8,<9"

@@ -1,0 +1,63 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "objectstore.mojo"
+version = "0.1.0"
+description = "Storage and HTTP layer for magmalake: FileIO over local files, HTTP(S) range reads and S3 (SigV4, vended credentials, presigned URLs)."
+preview = ["pixi-build"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+# libcurl brings TLS + a CA bundle; the C shim (shim/) wraps it in a
+# non-variadic surface and installs lib/libobjectstoremojo.so into the env.
+libcurl = ">=8,<9"
+objectstore-shim = { path = "shim" }
+# The HTTP tests run against a throwaway `python -m http.server`; the S3
+# tests run against MinIO or moto. Both are driven by tests/run_tests.sh.
+python = ">=3.10,<3.14"
+
+[tasks]
+# Builds the test binary, spawns the local HTTP server (and MinIO/moto when
+# available), runs everything, tears the servers down. See tests/run_tests.sh.
+test = { cmd = "bash tests/run_tests.sh" }
+# Tests plus a CLI build, so a broken CLI fails CI too.
+check = { depends-on = ["test", "cli"] }
+cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/objectstore-mojo" }
+bench = { cmd = "bash bench/run_bench.sh" }
+fmt = { cmd = "mojo format src tests bench" }
+format-check = { cmd = "mojo format --check src tests bench" }
+
+# ── pixi-build: consumable as a pixi source dependency ──────────────────────
+# Conda package name is objectstore-mojo; the Mojo import stays
+# `from objectstore import …`.
+[package]
+name = "objectstore-mojo"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.build.config.pkg]
+path = "src/objectstore"
+name = "objectstore"
+
+[package.host-dependencies]
+mojo-compiler = "==1.0.0"
+
+[package.build-dependencies]
+mojo-compiler = "==1.0.0"
+
+[package.run-dependencies]
+mojo-compiler = ">=1.0.0,<2"
+objectstore-shim = { path = "shim" }
+
+# ── stable / nightly toolchain matrix (see CI) ──────────────────────────────
+[feature.nightly.dependencies]
+modular = ">=26.6.0.dev2026082605,<27"
+
+[feature.stable.dependencies]
+mojo-compiler = "==1.0.0"
+
+[environments]
+default = ["nightly"]
+stable = ["stable"]
