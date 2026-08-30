@@ -30,6 +30,17 @@
  * Build: shim/pixi.toml (pixi-build-cmake) -> $CONDA_PREFIX/lib/libobjectstoremojo.so
  */
 
+#ifndef _WIN32
+/*
+ * dladdr, Dl_info and RTLD_NODELETE are GNU extensions on glibc: <dlfcn.h>
+ * hides them behind __USE_GNU unless this is defined before any header is
+ * included. macOS declares them unconditionally, so only Linux notices.
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#endif
+
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +48,11 @@
 #include <time.h>
 #ifndef _WIN32
 #include <dlfcn.h>
+/* Absent on a platform without it: dlopen alone still pins us, because the
+   reference taken below is never released. */
+#ifndef RTLD_NODELETE
+#define RTLD_NODELETE 0
+#endif
 #endif
 
 /* ------------------------------------------------------------------------ */
