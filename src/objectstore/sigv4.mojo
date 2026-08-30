@@ -50,8 +50,8 @@ def epoch_now() raises -> Int:
 
 
 def _do_epoch_now(imm lib: OwnedDLHandle) raises -> Int:
-    var fn = lib.get_function[c_long_long]("os_time_epoch")
-    return Int(fn())
+    var epoch_fn = lib.get_function[c_long_long]("os_time_epoch")
+    return Int(epoch_fn())
 
 
 def _pad2(v: Int) -> String:

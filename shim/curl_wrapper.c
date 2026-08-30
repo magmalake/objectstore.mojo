@@ -180,7 +180,12 @@ os_http_result *os_http_request(const char *method,
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, write_cb);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, (void *)&r->headers);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, ""); /* let curl negotiate */
+    /*
+     * Deliberately no CURLOPT_ACCEPT_ENCODING: transparent gzip would make
+     * Content-Length describe the compressed body, so a HEAD would report the
+     * wrong object size and a Range would address the wrong bytes. Object
+     * stores serve bytes, not documents.
+     */
     curl_easy_setopt(h, CURLOPT_USERAGENT, "objectstore.mojo/0.1");
     if (timeout_ms > 0) {
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeout_ms);
