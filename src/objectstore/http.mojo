@@ -29,10 +29,16 @@ its connections kept apart.
 Mojo has no threads today, so this costs nothing and is why the shim's share
 handle installs no locking callbacks; if that changes, each thread needs its
 own pool.
+
+**Retries.** Transport failures, 429 and most 5xx are retried with exponential
+backoff and jitter, but only for requests that can safely be repeated — see
+`RetryPolicy`. A response that is *returned* is never retried behind the
+caller's back on a method the server might have already acted on.
 """
 
 from std.ffi import OwnedDLHandle, c_int, c_long, c_long_long, c_size_t
 from std.os import getenv
+from std.time import monotonic, sleep
 
 
 comptime DEFAULT_TIMEOUT_MS = 30000
@@ -201,6 +207,117 @@ def header_blob(headers: List[Header]) -> String:
         out += ": "
         out += headers[k].value
     return out^
+
+
+# ---------------------------------------------------------------------------
+# Retries
+# ---------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct RetryPolicy(Copyable, Movable):
+    """When to try again, and how long to wait first.
+
+    Defaults: three retries (four attempts), 100 ms doubling to a 20 s ceiling,
+    and **idempotent requests only**. `POST` is retried only when the caller
+    has said the server can deduplicate it by supplying an `Idempotency-Key`
+    header — which is exactly what an Iceberg REST commit does, and why the
+    header is the trigger rather than a flag on the client.
+    """
+
+    var max_retries: Int
+    """Attempts *after* the first. 0 disables retrying entirely."""
+    var base_delay_ms: Int
+    var max_delay_ms: Int
+    var retry_non_idempotent: Bool
+    """Escape hatch for a caller that knows its `POST` is safe to repeat and
+    cannot add a header. Off, because guessing wrong duplicates a write."""
+
+    def __init__(out self):
+        self.max_retries = 3
+        self.base_delay_ms = 100
+        self.max_delay_ms = 20000
+        self.retry_non_idempotent = False
+
+    @staticmethod
+    def none() -> Self:
+        """One request, one answer — the 0.1.x behaviour."""
+        var p = Self()
+        p.max_retries = 0
+        return p^
+
+
+def is_idempotent(method: String, headers: List[Header]) -> Bool:
+    """RFC 9110 idempotency, plus the `Idempotency-Key` convention.
+
+    `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE` are idempotent by
+    definition: repeating one cannot commit a second effect. `POST` and
+    `PATCH` are not, so they are only repeatable when the request carries a
+    key the server can deduplicate on.
+    """
+    if method == "POST" or method == "PATCH":
+        for k in range(len(headers)):
+            if _ascii_lower(headers[k].name) == "idempotency-key":
+                return True
+        return False
+    return True
+
+
+def retryable_status(status: Int) -> Bool:
+    """429 and 5xx, except the two that mean "never, no matter how often".
+
+    501 Not Implemented and 505 HTTP Version Not Supported are permanent facts
+    about the server; retrying them is pure latency.
+    """
+    if status == 429:
+        return True
+    if status == 501 or status == 505:
+        return False
+    return status >= 500 and status < 600
+
+
+comptime S3_RETRYABLE_CODES = 2
+
+
+def s3_retryable_error(body: Span[UInt8, _]) -> Bool:
+    """S3's two "come back later" errors, which arrive with unhelpful statuses.
+
+    `SlowDown` is throttling and `RequestTimeout` means the server gave up
+    waiting on the body; AWS returns the latter as a **400**, so status alone
+    would call it permanent. Only the first bytes are inspected, and only for
+    a response that already failed, so this never touches an object body.
+    """
+    var n = len(body)
+    if n > 1024:
+        n = 1024
+    var head = String(StringSlice(unsafe_from_utf8=Span(body)[0:n]))
+    if head.find("<Code>SlowDown</Code>") >= 0:
+        return True
+    return head.find("<Code>RequestTimeout</Code>") >= 0
+
+
+def backoff_delay_ms(policy: RetryPolicy, attempt: Int) -> Int:
+    """Exponential backoff with jitter: half the window fixed, half random.
+
+    `attempt` counts from 1. Full jitter would sometimes retry instantly and
+    hammer a server that is already asking for room; half is the usual
+    compromise. The jitter source is the monotonic clock's low bits — there is
+    no RNG in reach here, and a retry schedule does not need a good one.
+    """
+    var window = policy.base_delay_ms
+    for _ in range(attempt - 1):
+        if window >= policy.max_delay_ms:
+            break
+        window *= 2
+    if window > policy.max_delay_ms:
+        window = policy.max_delay_ms
+    if window <= 1:
+        return window
+    var half = window // 2
+    var jitter = Int(monotonic()) % (half + 1)
+    if jitter < 0:
+        jitter = -jitter
+    return half + jitter
 
 
 # ---------------------------------------------------------------------------
@@ -421,12 +538,14 @@ struct HttpClient(Copyable, Movable):
     var pool: Int
     """`SHARED_POOL`, or a handle from `new_connection_pool()` that the caller
     is responsible for freeing."""
+    var retry: RetryPolicy
 
     def __init__(out self):
         self.timeout_ms = DEFAULT_TIMEOUT_MS
         self.follow_redirects = False
         self.verify_tls = True
         self.pool = SHARED_POOL
+        self.retry = RetryPolicy()
 
     def request(
         self,
@@ -437,22 +556,52 @@ struct HttpClient(Copyable, Movable):
         range_start: Int = -1,
         range_end: Int = -1,
     ) raises -> Response:
-        """Performs one request. Raises only on *transport* failure — a 404 or
-        a 500 comes back as a `Response` so the caller can decide."""
-        var lib = OwnedDLHandle(_find_lib())
-        return _do_request(
-            lib,
-            self.pool,
-            method,
-            url,
-            header_blob(headers),
-            body,
-            range_start,
-            range_end,
-            self.timeout_ms,
-            self.follow_redirects,
-            self.verify_tls,
+        """Performs the request, retrying per `self.retry`.
+
+        Raises only on *transport* failure — a 404 or a 500 comes back as a
+        `Response` so the caller can decide. A retryable status that survives
+        the last attempt is returned too: the caller sees the server's own
+        answer rather than an invented error.
+        """
+        var repeatable = self.retry.retry_non_idempotent or is_idempotent(
+            method, headers
         )
+        var blob = header_blob(headers)
+        var attempt = 0
+        while True:
+            try:
+                var lib = OwnedDLHandle(_find_lib())
+                var resp = _do_request(
+                    lib,
+                    self.pool,
+                    method,
+                    url,
+                    blob,
+                    body,
+                    range_start,
+                    range_end,
+                    self.timeout_ms,
+                    self.follow_redirects,
+                    self.verify_tls,
+                )
+                if attempt >= self.retry.max_retries or not repeatable:
+                    return resp^
+                if not (
+                    retryable_status(resp.status)
+                    or (not resp.ok() and s3_retryable_error(Span(resp.body)))
+                ):
+                    return resp^
+                attempt += 1
+                sleep(Float64(backoff_delay_ms(self.retry, attempt)) / 1000.0)
+            except e:
+                # A transport failure — no response at all, so for an
+                # idempotent request there is nothing to be inconsistent
+                # about. This is also the case connection reuse makes more
+                # likely: a pooled socket the server closed while it was idle.
+                if attempt >= self.retry.max_retries or not repeatable:
+                    raise e
+                attempt += 1
+                sleep(Float64(backoff_delay_ms(self.retry, attempt)) / 1000.0)
 
     def get(
         self,

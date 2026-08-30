@@ -101,12 +101,13 @@ class Handler(BaseHTTPRequestHandler):
             if fails < 0 or seen <= fails:
                 extra = {"Retry-After": "0"} if code == 429 else None
                 payload = params.get("payload", "")
-                if payload == "s3slowdown":
+                if payload in ("s3slowdown", "s3timeout"):
+                    s3code = "SlowDown" if payload == "s3slowdown" else "RequestTimeout"
                     return self._send(
                         code,
-                        b"<?xml version=\"1.0\"?><Error><Code>SlowDown</Code>"
-                        b"<Message>Please reduce your request rate.</Message>"
-                        b"</Error>",
+                        ('<?xml version="1.0"?><Error><Code>%s</Code>'
+                         "<Message>try again</Message></Error>" % s3code
+                         ).encode("ascii"),
                         "application/xml",
                         extra,
                     )

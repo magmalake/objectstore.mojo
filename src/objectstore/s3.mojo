@@ -335,6 +335,17 @@ struct S3Client(Copyable, Movable):
         self.config = config^
         self.http = http^
 
+    def set_max_retries(mut self, n: Int):
+        """Retries per request; 3 by default, 0 to disable.
+
+        The full policy — backoff window, ceiling, whether a non-idempotent
+        request may be repeated — is `self.http.retry`. S3 needs this more
+        than most callers do: `SlowDown` is how a bucket says "you are going
+        too fast", and it arrives at exactly the moment a scan is issuing its
+        hundredth range read.
+        """
+        self.http.retry.max_retries = n
+
     # ── addressing ─────────────────────────────────────────────────────────
     def _endpoint_parts(self) raises -> Tuple[String, String]:
         """Returns `(scheme, host[:port])` for the configured endpoint."""

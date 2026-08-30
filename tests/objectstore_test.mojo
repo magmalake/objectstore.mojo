@@ -39,13 +39,18 @@ from objectstore.gcs import GcsConfig, split_gcs_uri
 from objectstore.http import (
     Header,
     HttpClient,
+    RetryPolicy,
     SHARED_POOL,
+    backoff_delay_ms,
     free_connection_pool,
     header_blob,
+    is_idempotent,
     new_connection_pool,
     parse_headers,
     pool_stats,
     reset_pool_stats,
+    retryable_status,
+    s3_retryable_error,
     shim_abi,
 )
 from objectstore.httpio import HttpInputFile
@@ -562,6 +567,194 @@ def test_http_dedicated_pool() raises:
     assert_equal(stats[0], 5)
     assert_equal(stats[1], 1)
     free_connection_pool(pool)
+
+
+# ---------------------------------------------------------------------------
+# Retries
+# ---------------------------------------------------------------------------
+
+
+def _fast_retries(max_retries: Int) -> RetryPolicy:
+    """The default policy with the waiting taken out, so the suite stays fast.
+
+    `backoff_delay_ms` is unit-tested separately; what these tests are about
+    is *which* requests are repeated, not how long the pause is.
+    """
+    var p = RetryPolicy()
+    p.max_retries = max_retries
+    p.base_delay_ms = 1
+    p.max_delay_ms = 4
+    return p^
+
+
+def _attempts(base: String, key: String) raises -> Int:
+    var c = HttpClient()
+    var r = c.get(base + "/attempts?key=" + key)
+    var text = r.text()
+    var at = text.find("attempts=")
+    var end = text.find("\n", at)
+    return Int(
+        String(
+            StringSlice(unsafe_from_utf8=Span(text.as_bytes())[at + 9 : end])
+        )
+    )
+
+
+def test_retry_classification() raises:
+    """Which statuses and bodies are worth trying again — no server needed."""
+    assert_true(retryable_status(429))
+    assert_true(retryable_status(500))
+    assert_true(retryable_status(503))
+    assert_true(retryable_status(504))
+    # Permanent facts about the server, not weather.
+    assert_true(not retryable_status(501))
+    assert_true(not retryable_status(505))
+    assert_true(not retryable_status(404))
+    assert_true(not retryable_status(403))
+    assert_true(not retryable_status(200))
+
+    var slow = _bytes(
+        String("<Error><Code>SlowDown</Code><Message>x</Message></Error>")
+    )
+    assert_true(s3_retryable_error(Span(slow)))
+    var timeout = _bytes(String("<Error><Code>RequestTimeout</Code></Error>"))
+    assert_true(s3_retryable_error(Span(timeout)))
+    var denied = _bytes(String("<Error><Code>AccessDenied</Code></Error>"))
+    assert_true(not s3_retryable_error(Span(denied)))
+
+    var plain = List[Header]()
+    assert_true(is_idempotent(String("GET"), plain))
+    assert_true(is_idempotent(String("PUT"), plain))
+    assert_true(is_idempotent(String("DELETE"), plain))
+    assert_true(not is_idempotent(String("POST"), plain))
+    var keyed = List[Header]()
+    keyed.append(Header("Idempotency-Key", "abc-123"))
+    assert_true(is_idempotent(String("POST"), keyed))
+    # iceberg.mojo sets the header with this exact casing; matching is
+    # case-insensitive because HTTP is.
+    var lower = List[Header]()
+    lower.append(Header("idempotency-key", "abc-123"))
+    assert_true(is_idempotent(String("POST"), lower))
+
+
+def test_backoff_delay() raises:
+    """Exponential, jittered, and capped."""
+    var p = RetryPolicy()
+    assert_equal(p.max_retries, 3)
+    for attempt in range(1, 5):
+        var window = 100 * (1 << (attempt - 1))
+        var d = backoff_delay_ms(p, attempt)
+        assert_true(d >= window // 2)
+        assert_true(d <= window)
+    # The ceiling holds however many attempts have gone by.
+    assert_true(backoff_delay_ms(p, 20) <= p.max_delay_ms)
+    assert_true(backoff_delay_ms(p, 20) >= p.max_delay_ms // 2)
+    # A one-millisecond window degenerates instead of jittering to zero.
+    var tiny = RetryPolicy()
+    tiny.base_delay_ms = 1
+    assert_equal(backoff_delay_ms(tiny, 1), 1)
+    assert_true(backoff_delay_ms(RetryPolicy.none(), 1) <= 100)
+
+
+def test_retry_transient_failures() raises:
+    """Two 503s then a 200, and the same for a 429."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_retry_transient_failures: no server")
+        return
+    var c = HttpClient()
+    c.retry = _fast_retries(3)
+
+    var r = c.get(base + "/flaky/503/2?key=t503")
+    assert_equal(r.status, 200)
+    assert_true(r.text().find("attempts=3") >= 0)
+    assert_equal(_attempts(base, String("t503")), 3)
+
+    var r429 = c.get(base + "/flaky/429/1?key=t429")
+    assert_equal(r429.status, 200)
+    assert_equal(_attempts(base, String("t429")), 2)
+
+    # 501 is permanent: one attempt, and the caller sees the real status.
+    var r501 = c.get(base + "/flaky/501/5?key=t501")
+    assert_equal(r501.status, 501)
+    assert_equal(_attempts(base, String("t501")), 1)
+
+
+def test_retry_gives_up() raises:
+    """A server that never recovers: the caller gets the server's own answer."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_retry_gives_up: no server")
+        return
+    var c = HttpClient()
+    c.retry = _fast_retries(2)
+    var r = c.get(base + "/flaky/503/-1?key=always")
+    assert_equal(r.status, 503)
+    # One try plus two retries — not an invented transport error.
+    assert_equal(_attempts(base, String("always")), 3)
+
+    var off = HttpClient()
+    off.retry = RetryPolicy.none()
+    assert_equal(off.get(base + "/flaky/503/-1?key=off").status, 503)
+    assert_equal(_attempts(base, String("off")), 1)
+
+    # A transport failure still raises once the retries are spent.
+    var dead = HttpClient()
+    dead.retry = _fast_retries(2)
+    dead.timeout_ms = 400
+    with assert_raises():
+        _ = dead.get(String("http://127.0.0.1:9/never-listening"))
+
+
+def test_retry_only_when_repeatable() raises:
+    """A bare POST is never repeated; one with an `Idempotency-Key` is."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_retry_only_when_repeatable: no server")
+        return
+    var c = HttpClient()
+    c.retry = _fast_retries(3)
+    var body = _bytes(String("commit"))
+
+    var bare = c.post(base + "/flaky/503/2?key=post-bare", Span(body))
+    assert_equal(bare.status, 503)
+    assert_equal(_attempts(base, String("post-bare")), 1)
+
+    # This is exactly what iceberg.mojo's REST commit sends.
+    var hs = List[Header]()
+    hs.append(Header("Idempotency-Key", "commit-42"))
+    var keyed = c.post(base + "/flaky/503/2?key=post-key", Span(body), hs)
+    assert_equal(keyed.status, 200)
+    assert_true(keyed.text().find("idem=commit-42") >= 0)
+    assert_equal(_attempts(base, String("post-key")), 3)
+
+    # PUT is idempotent by definition, so it needs no header.
+    var put = c.put(base + "/flaky/503/2?key=put", Span(body))
+    assert_equal(put.status, 200)
+    assert_equal(_attempts(base, String("put")), 3)
+
+
+def test_retry_s3_error_codes() raises:
+    """`SlowDown` and `RequestTimeout` arrive as a 400 and are still transient."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_retry_s3_error_codes: no server")
+        return
+    var c = HttpClient()
+    c.retry = _fast_retries(3)
+
+    var slow = c.get(base + "/flaky/400/2?key=slow&payload=s3slowdown")
+    assert_equal(slow.status, 200)
+    assert_equal(_attempts(base, String("slow")), 3)
+
+    var to = c.get(base + "/flaky/400/1?key=reqto&payload=s3timeout")
+    assert_equal(to.status, 200)
+    assert_equal(_attempts(base, String("reqto")), 2)
+
+    # A plain 400 is the caller's fault and is not repeated.
+    var bad = c.get(base + "/flaky/400/5?key=plain400")
+    assert_equal(bad.status, 400)
+    assert_equal(_attempts(base, String("plain400")), 1)
 
 
 # ---------------------------------------------------------------------------
