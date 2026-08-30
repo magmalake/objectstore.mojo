@@ -36,7 +36,18 @@ from objectstore.fileio import (
     FileIOResolver,
 )
 from objectstore.gcs import GcsConfig, split_gcs_uri
-from objectstore.http import Header, HttpClient, header_blob, parse_headers
+from objectstore.http import (
+    Header,
+    HttpClient,
+    SHARED_POOL,
+    free_connection_pool,
+    header_blob,
+    new_connection_pool,
+    parse_headers,
+    pool_stats,
+    reset_pool_stats,
+    shim_abi,
+)
 from objectstore.httpio import HttpInputFile
 from objectstore.local import (
     LocalInputFile,
@@ -502,6 +513,55 @@ def test_http_input_file() raises:
     )
 
     assert_true(not HttpInputFile(base + "/files/nope.txt").exists())
+
+
+def test_http_connection_reuse() raises:
+    """Twenty requests, one TCP connection — asserted from both ends.
+
+    curl's own connection counter says how many sockets it opened; the test
+    server counts the distinct client ports it saw. Timing would only suggest
+    reuse, these two prove it.
+    """
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_http_connection_reuse: no server")
+        return
+    if shim_abi() < 2:
+        print("SKIP test_http_connection_reuse: shim ABI", shim_abi(), "< 2")
+        return
+    var c = HttpClient()
+    reset_pool_stats()
+    # This one may reuse a connection an earlier test left open, which is
+    # itself the behaviour under test; what must not happen is a new socket
+    # for each of the twenty that follow.
+    assert_equal(c.get(base + "/ports/reset").status, 200)
+    for _ in range(20):
+        assert_equal(c.get(base + "/files/hello.txt").status, 200)
+    var stats = pool_stats()
+    assert_equal(stats[0], 21)
+    assert_true(stats[1] <= 1)
+    assert_true(c.get(base + "/ports").text().find("count=1") >= 0)
+
+
+def test_http_dedicated_pool() raises:
+    """A private pool opens exactly one connection and no more."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_http_dedicated_pool: no server")
+        return
+    if shim_abi() < 2:
+        print("SKIP test_http_dedicated_pool: shim ABI", shim_abi(), "< 2")
+        return
+    var pool = new_connection_pool()
+    assert_true(pool != SHARED_POOL)
+    var c = HttpClient()
+    c.pool = pool
+    for _ in range(5):
+        assert_equal(c.get(base + "/files/hello.txt").status, 200)
+    var stats = pool_stats(pool)
+    assert_equal(stats[0], 5)
+    assert_equal(stats[1], 1)
+    free_connection_pool(pool)
 
 
 # ---------------------------------------------------------------------------

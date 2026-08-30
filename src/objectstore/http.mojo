@@ -17,6 +17,18 @@ Every FFI-calling worker takes the handle as a borrowed `imm` parameter: Mojo
 destroys a value at its last syntactic use, so a function that both owned the
 handle and called `get_function` on it would `dlclose` the library before the
 returned function pointer is invoked.
+
+**Connection reuse.** The curl easy handle lives in the shim and persists
+across requests, so a second request to the same host reuses its TCP and TLS
+session instead of shaking hands again — the difference between ~2.9 ms and
+~0.2 ms per range read on loopback. Requests go to a process-wide pool by
+default; `new_connection_pool` hands out a private one for a caller that wants
+its connections kept apart.
+
+**Threads.** An `HttpClient` — and the pool behind it — is single-threaded.
+Mojo has no threads today, so this costs nothing and is why the shim's share
+handle installs no locking callbacks; if that changes, each thread needs its
+own pool.
 """
 
 from std.ffi import OwnedDLHandle, c_int, c_long, c_long_long, c_size_t
@@ -60,6 +72,79 @@ def _read_cstring(addr: Int) -> String:
         return String("")
     var p = UnsafePointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
     return String(unsafe_from_utf8_ptr=p)
+
+
+comptime SHARED_POOL = 0
+"""The process-wide connection pool, which is what every `HttpClient` uses
+unless it is given one of its own."""
+
+
+# ---------------------------------------------------------------------------
+# Connection pools
+# ---------------------------------------------------------------------------
+
+
+def new_connection_pool() raises -> Int:
+    """A private pool: one persistent curl handle, its own connections.
+
+    Returns an opaque handle to pass as `HttpClient.pool`. **The caller owns
+    it** and must call `free_connection_pool`; there is no destructor here
+    because `HttpClient` is `Copyable`, and a copyable owner of a C resource
+    is a double free waiting to happen. Most callers want `SHARED_POOL`.
+    """
+    var lib = OwnedDLHandle(_find_lib())
+    return _pool_new(lib)
+
+
+def _pool_new(imm lib: OwnedDLHandle) raises -> Int:
+    var new_fn = lib.get_function[Int]("os_http_client_new")
+    var p = Int(new_fn())
+    if p == 0:
+        raise Error("objectstore.http: could not create a connection pool")
+    return p
+
+
+def free_connection_pool(pool: Int) raises:
+    """Closes a pool from `new_connection_pool` and its live connections."""
+    if pool == SHARED_POOL:
+        return
+    var lib = OwnedDLHandle(_find_lib())
+    _pool_free(lib, pool)
+
+
+def _pool_free(imm lib: OwnedDLHandle, pool: Int) raises:
+    var free_fn = lib.get_function[NoneType]("os_http_client_free")
+    _ = free_fn(pool)
+
+
+def pool_stats(pool: Int = SHARED_POOL) raises -> Tuple[Int, Int]:
+    """`(requests, connections)` for a pool since the last `reset_pool_stats`.
+
+    `connections` is what curl actually opened, so reuse is the observation
+    that it stays at 1 while `requests` climbs — which is how the tests prove
+    it rather than inferring it from a stopwatch.
+    """
+    var lib = OwnedDLHandle(_find_lib())
+    return _pool_stats(lib, pool)
+
+
+def _pool_stats(imm lib: OwnedDLHandle, pool: Int) raises -> Tuple[Int, Int]:
+    var req_fn = lib.get_function[c_long]("os_http_client_requests")
+    var con_fn = lib.get_function[c_long]("os_http_client_connects")
+    return Tuple(Int(req_fn(pool)), Int(con_fn(pool)))
+
+
+def reset_pool_stats(pool: Int = SHARED_POOL) raises:
+    var lib = OwnedDLHandle(_find_lib())
+    var reset_fn = lib.get_function[NoneType]("os_http_client_reset_stats")
+    _ = reset_fn(pool)
+
+
+def shim_abi() raises -> Int:
+    """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections."""
+    var lib = OwnedDLHandle(_find_lib())
+    var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
+    return Int(abi_fn())
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +310,7 @@ def parse_headers(raw: String) -> List[Header]:
 
 def _do_request(
     imm lib: OwnedDLHandle,
+    pool: Int,
     method: String,
     url: String,
     headers: String,
@@ -239,22 +325,43 @@ def _do_request(
     var u = _cstr(url)
     var h = _cstr(headers)
 
-    var request_fn = lib.get_function[Int]("os_http_request")
     var body_addr = 0
     if len(body) > 0:
         body_addr = Int(body.unsafe_ptr())
-    var res = request_fn(
-        Int(m.unsafe_ptr()),
-        Int(u.unsafe_ptr()),
-        Int(h.unsafe_ptr()),
-        body_addr,
-        c_size_t(len(body)),
-        c_long_long(range_start),
-        c_long_long(range_end),
-        c_long(timeout_ms),
-        c_int(1) if follow_redirects else c_int(0),
-        c_int(1) if verify_tls else c_int(0),
-    )
+    var res: Int
+    if pool == SHARED_POOL:
+        # The 0.1.x entry point, still exported and still meaning "the
+        # process-wide client". Calling it rather than `_ex` for the default
+        # case is what lets a consumer whose lock file pins an older
+        # objectstore-shim build compile against these sources unchanged.
+        var request_fn = lib.get_function[Int]("os_http_request")
+        res = request_fn(
+            Int(m.unsafe_ptr()),
+            Int(u.unsafe_ptr()),
+            Int(h.unsafe_ptr()),
+            body_addr,
+            c_size_t(len(body)),
+            c_long_long(range_start),
+            c_long_long(range_end),
+            c_long(timeout_ms),
+            c_int(1) if follow_redirects else c_int(0),
+            c_int(1) if verify_tls else c_int(0),
+        )
+    else:
+        var request_ex_fn = lib.get_function[Int]("os_http_request_ex")
+        res = request_ex_fn(
+            pool,
+            Int(m.unsafe_ptr()),
+            Int(u.unsafe_ptr()),
+            Int(h.unsafe_ptr()),
+            body_addr,
+            c_size_t(len(body)),
+            c_long_long(range_start),
+            c_long_long(range_end),
+            c_long(timeout_ms),
+            c_int(1) if follow_redirects else c_int(0),
+            c_int(1) if verify_tls else c_int(0),
+        )
     # The three buffers must outlive the call above; naming them here is the
     # documented way to stop Mojo destroying them at their last use.
     _ = m^
@@ -296,7 +403,13 @@ def _do_request(
 
 @fieldwise_init
 struct HttpClient(Copyable, Movable):
-    """A stateless HTTP client. Each call is one libcurl easy handle.
+    """An HTTP client over a persistent, reused connection.
+
+    The client itself holds no socket: `pool` names a curl handle living in
+    the shim, and `SHARED_POOL` — the default — is the process-wide one. Two
+    `HttpClient` values therefore share connections, which is what makes an
+    Iceberg scan that opens a new `S3Client` per file cheap. Single-threaded,
+    like everything else in Mojo today.
 
     Redirects are **off** by default: a presigned S3 URL carries its signature
     in the query string and must never be silently re-issued elsewhere.
@@ -305,11 +418,15 @@ struct HttpClient(Copyable, Movable):
     var timeout_ms: Int
     var follow_redirects: Bool
     var verify_tls: Bool
+    var pool: Int
+    """`SHARED_POOL`, or a handle from `new_connection_pool()` that the caller
+    is responsible for freeing."""
 
     def __init__(out self):
         self.timeout_ms = DEFAULT_TIMEOUT_MS
         self.follow_redirects = False
         self.verify_tls = True
+        self.pool = SHARED_POOL
 
     def request(
         self,
@@ -325,6 +442,7 @@ struct HttpClient(Copyable, Movable):
         var lib = OwnedDLHandle(_find_lib())
         return _do_request(
             lib,
+            self.pool,
             method,
             url,
             header_blob(headers),

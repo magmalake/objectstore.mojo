@@ -14,6 +14,19 @@
  * is therefore a fixed-arity, ABI-hygienic function. Buffers that cross the
  * boundary are malloc'd here and freed here (os_http_result_free).
  *
+ * Connection reuse: a request used to create and destroy a curl easy handle,
+ * so every request paid a fresh TCP (and TLS) handshake — ~2.9 ms on loopback,
+ * far more against a real endpoint. Handles now persist in an `os_http_client`
+ * and are reset (not destroyed) between requests, because curl_easy_reset
+ * explicitly keeps the live connections, the DNS cache and the TLS session
+ * cache while clearing the options.
+ *
+ * Thread safety: an os_http_client is NOT thread safe, and neither is the
+ * process-wide default client. Mojo has no threads today, and the share handle
+ * below deliberately carries no lock callbacks for the same reason; if Mojo
+ * ever grows threads, each thread needs its own client and the share handle
+ * needs CURLSHOPT_LOCKFUNC.
+ *
  * Build: shim/pixi.toml (pixi-build-cmake) -> $CONDA_PREFIX/lib/libobjectstoremojo.so
  */
 
@@ -22,6 +35,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Growable byte buffer                                                      */
@@ -101,6 +117,110 @@ void os_http_result_free(os_http_result *r) {
 
 static int g_inited = 0;
 
+/* ------------------------------------------------------------------------ */
+/* Clients: a persistent easy handle, so TCP+TLS is set up once per host     */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    CURL *easy;
+    long requests;   /* requests performed on this client */
+    long connects;   /* connections curl actually had to open */
+} os_http_client;
+
+static CURLSH *g_share = NULL;
+static os_http_client *g_default = NULL;
+
+/*
+ * Mojo opens this library through an OwnedDLHandle and closes it when that
+ * value dies — which, if the loader honoured the dlclose(), would unmap the
+ * pooled connections along with everything else and make reuse a no-op. Take a
+ * permanent reference to ourselves the first time we are called; it is never
+ * released, which is the point.
+ */
+static void pin_self(void) {
+#ifndef _WIN32
+    Dl_info info;
+    if (dladdr((void *)(size_t)&pin_self, &info) && info.dli_fname) {
+        void *self = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NODELETE);
+        (void)self;
+    }
+#endif
+}
+
+static void ensure_global(void) {
+    if (g_inited) return;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    pin_self();
+    /*
+     * DNS and TLS sessions are shared across clients: a resolver round trip
+     * and a TLS resumption are worth more than the (single-threaded) locking
+     * they would otherwise need. Connections are deliberately NOT shared —
+     * CURL_LOCK_DATA_CONNECT hands connections between handles, which is only
+     * safe with locking callbacks this build does not install.
+     */
+    g_share = curl_share_init();
+    if (g_share) {
+        curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    }
+    g_inited = 1;
+}
+
+os_http_client *os_http_client_new(void) {
+    ensure_global();
+    os_http_client *c = (os_http_client *)calloc(1, sizeof(os_http_client));
+    if (!c) return NULL;
+    c->easy = curl_easy_init();
+    if (!c->easy) {
+        free(c);
+        return NULL;
+    }
+    if (g_share) curl_easy_setopt(c->easy, CURLOPT_SHARE, g_share);
+    return c;
+}
+
+void os_http_client_free(os_http_client *c) {
+    if (!c) return;
+    if (c == g_default) return; /* the process-wide client outlives callers */
+    if (c->easy) curl_easy_cleanup(c->easy);
+    free(c);
+}
+
+/* NULL means the process-wide default client. */
+static os_http_client *client_or_default(os_http_client *c) {
+    if (c) return c;
+    ensure_global();
+    if (!g_default) g_default = os_http_client_new();
+    return g_default;
+}
+
+long os_http_client_requests(os_http_client *c) {
+    os_http_client *cl = client_or_default(c);
+    return cl ? cl->requests : 0;
+}
+
+/*
+ * How many TCP connections curl had to open for this client. The whole point
+ * of the pool is that this stays at 1 while `requests` climbs: the tests
+ * assert exactly that.
+ */
+long os_http_client_connects(os_http_client *c) {
+    os_http_client *cl = client_or_default(c);
+    return cl ? cl->connects : 0;
+}
+
+void os_http_client_reset_stats(os_http_client *c) {
+    os_http_client *cl = client_or_default(c);
+    if (cl) {
+        cl->requests = 0;
+        cl->connects = 0;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Request                                                                   */
+/* ------------------------------------------------------------------------ */
+
 /*
  * Headers arrive as one '\n'-separated blob of "Name: Value" lines. HTTP
  * header values cannot contain a bare LF, so this is lossless, and it spares
@@ -130,27 +250,28 @@ static struct curl_slist *build_headers(const char *blob) {
 }
 
 /*
- * One HTTP request. `method` is GET/PUT/POST/DELETE/HEAD (anything else is
- * sent verbatim as a custom method). `range_start`/`range_end` < 0 mean "no
- * Range header"; a negative `range_end` with a non-negative start emits an
- * open-ended "start-". Redirects are OFF unless `follow_redirects` is set —
- * a presigned URL must never be silently re-issued somewhere else. TLS
- * verification is ON unless explicitly disabled (test servers with
- * self-signed certs). Proxies come from the environment via CURLOPT_NETRC-
- * free default behaviour (`http_proxy`/`https_proxy`/`no_proxy`).
+ * One HTTP request on `client` (NULL = the process-wide client). `method` is
+ * GET/PUT/POST/DELETE/HEAD (anything else is sent verbatim as a custom
+ * method). `range_start`/`range_end` < 0 mean "no Range header"; a negative
+ * `range_end` with a non-negative start emits an open-ended "start-".
+ * Redirects are OFF unless `follow_redirects` is set — a presigned URL must
+ * never be silently re-issued somewhere else. TLS verification is ON unless
+ * explicitly disabled (test servers with self-signed certs). Proxies come from
+ * the environment (`http_proxy`/`https_proxy`/`no_proxy`).
  *
  * Returns a malloc'd result the caller must pass to os_http_result_free.
  */
-os_http_result *os_http_request(const char *method,
-                                const char *url,
-                                const char *headers_blob,
-                                const void *body,
-                                size_t body_len,
-                                long long range_start,
-                                long long range_end,
-                                long timeout_ms,
-                                int follow_redirects,
-                                int verify_tls) {
+os_http_result *os_http_request_ex(os_http_client *client,
+                                   const char *method,
+                                   const char *url,
+                                   const char *headers_blob,
+                                   const void *body,
+                                   size_t body_len,
+                                   long long range_start,
+                                   long long range_end,
+                                   long timeout_ms,
+                                   int follow_redirects,
+                                   int verify_tls) {
     os_http_result *r = (os_http_result *)calloc(1, sizeof(os_http_result));
     if (!r) return NULL;
     buf_init(&r->body);
@@ -158,17 +279,21 @@ os_http_result *os_http_request(const char *method,
     r->rc = (int)CURLE_OK;
     r->err[0] = 0;
 
-    if (!g_inited) {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        g_inited = 1;
-    }
-
-    CURL *h = curl_easy_init();
-    if (!h) {
+    os_http_client *cl = client_or_default(client);
+    if (!cl || !cl->easy) {
         r->rc = (int)CURLE_FAILED_INIT;
         snprintf(r->err, sizeof(r->err), "curl_easy_init failed");
         return r;
     }
+    CURL *h = cl->easy;
+
+    /*
+     * Reset rather than recreate: curl_easy_reset clears every option set
+     * below (so nothing leaks from the previous request) but explicitly keeps
+     * the live connections, the DNS cache, the TLS session cache and the
+     * share handle — which is the entire reason this handle is persistent.
+     */
+    curl_easy_reset(h);
 
     char errbuf[CURL_ERROR_SIZE];
     errbuf[0] = 0;
@@ -180,13 +305,24 @@ os_http_result *os_http_request(const char *method,
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, write_cb);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, (void *)&r->headers);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    if (g_share) curl_easy_setopt(h, CURLOPT_SHARE, g_share);
+    /*
+     * Keep the socket alive between requests and keep enough of them cached
+     * that alternating hosts — an Iceberg REST catalog and an S3 endpoint, say
+     * — do not evict each other. FORBID_REUSE and FRESH_CONNECT stay off
+     * (their defaults), which is what makes the pool a pool.
+     */
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPINTVL, 15L);
+    curl_easy_setopt(h, CURLOPT_MAXCONNECTS, 16L);
     /*
      * Deliberately no CURLOPT_ACCEPT_ENCODING: transparent gzip would make
      * Content-Length describe the compressed body, so a HEAD would report the
      * wrong object size and a Range would address the wrong bytes. Object
      * stores serve bytes, not documents.
      */
-    curl_easy_setopt(h, CURLOPT_USERAGENT, "objectstore.mojo/0.1");
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "objectstore.mojo/0.2");
     if (timeout_ms > 0) {
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeout_ms);
         curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS,
@@ -238,6 +374,12 @@ os_http_result *os_http_request(const char *method,
 
     CURLcode rc = curl_easy_perform(h);
     r->rc = (int)rc;
+    cl->requests += 1;
+    {
+        long opened = 0;
+        if (curl_easy_getinfo(h, CURLINFO_NUM_CONNECTS, &opened) == CURLE_OK)
+            cl->connects += opened;
+    }
     if (rc != CURLE_OK) {
         snprintf(r->err, sizeof(r->err), "%s%s%s",
                  curl_easy_strerror(rc),
@@ -251,9 +393,41 @@ os_http_result *os_http_request(const char *method,
         }
     }
 
+    /*
+     * The handle outlives this frame now, so nothing of this frame may stay
+     * reachable from it: errbuf is on the stack and POSTFIELDS/WRITEDATA point
+     * at buffers the caller is about to free. curl_easy_reset at the top of
+     * the next request would do this too, but a persistent handle holding
+     * dangling pointers in the meantime is not worth the saved lines.
+     */
+    curl_easy_setopt(h, CURLOPT_ERRORBUFFER, (void *)NULL);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDS, (void *)NULL);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, (void *)NULL);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, (void *)NULL);
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, (void *)NULL);
     if (hdrs) curl_slist_free_all(hdrs);
-    curl_easy_cleanup(h);
     return r;
+}
+
+/*
+ * The pre-0.2 entry point, kept byte-compatible on purpose: a consumer whose
+ * lock file pins an older `objectstore-shim` build still links against this
+ * symbol while compiling against newer Mojo sources. It is the same request on
+ * the process-wide client.
+ */
+os_http_result *os_http_request(const char *method,
+                                const char *url,
+                                const char *headers_blob,
+                                const void *body,
+                                size_t body_len,
+                                long long range_start,
+                                long long range_end,
+                                long timeout_ms,
+                                int follow_redirects,
+                                int verify_tls) {
+    return os_http_request_ex(NULL, method, url, headers_blob, body, body_len,
+                              range_start, range_end, timeout_ms,
+                              follow_redirects, verify_tls);
 }
 
 /* Diagnostics: "libcurl/8.x.y OpenSSL/3.x ..." */
@@ -269,4 +443,5 @@ const char *os_http_curl_version(void) { return curl_version(); }
  */
 long long os_time_epoch(void) { return (long long)time(NULL); }
 
-long os_http_shim_abi(void) { return 1; }
+/* 1 = 0.1.x (one easy handle per request); 2 = pooled clients. */
+long os_http_shim_abi(void) { return 2; }

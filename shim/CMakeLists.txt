@@ -10,6 +10,11 @@ if(NOT CURL_FOUND)
 endif()
 
 add_library(objectstoremojo SHARED curl_wrapper.c)
+# dladdr/dlopen: the shim takes a permanent reference to itself so that Mojo
+# closing its OwnedDLHandle cannot unmap the pooled connections. On glibc >=
+# 2.34 these live in libc, but CMAKE_DL_LIBS covers the platforms where they
+# do not.
+target_link_libraries(objectstoremojo PRIVATE ${CMAKE_DL_LIBS})
 if(TARGET CURL::libcurl)
     target_link_libraries(objectstoremojo PRIVATE CURL::libcurl)
 else()

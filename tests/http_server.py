@@ -12,6 +12,12 @@ Routes:
   /status/<code>  answers with that status and a short body
   /slow?ms=N      sleeps N milliseconds first (timeout tests)
   /noclen         a chunked response, so Content-Length is absent
+  /ports          "count=N": distinct client ports seen since the last reset,
+                  which is how the connection-reuse test observes that N
+                  requests rode one TCP connection
+  /ports/reset    forgets them, then counts its own
+  /flaky/<code>/<n>?key=k  fails with <code> the first n times a key is used,
+                  then answers 200 — the retry tests' server
 """
 import os
 import re
@@ -21,6 +27,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
+
+# Distinct client ports seen, i.e. distinct TCP connections. A keep-alive
+# client that reuses its connection shows up here as exactly one.
+SEEN_PORTS = set()
+# Per-key attempt counters for /flaky.
+ATTEMPTS = {}
+STATE_LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,6 +71,64 @@ class Handler(BaseHTTPRequestHandler):
     # ── verbs ──────────────────────────────────────────────────────────────
     def _serve(self):
         path, params = self._path_and_query()
+        with STATE_LOCK:
+            if path == "/ports/reset":
+                SEEN_PORTS.clear()
+            SEEN_PORTS.add(self.client_address[1])
+            n_ports = len(SEEN_PORTS)
+
+        if path == "/ports/reset":
+            return self._send(200, b"reset", "text/plain")
+
+        if path == "/ports":
+            return self._send(
+                200, ("count=%d\n" % n_ports).encode("ascii"), "text/plain"
+            )
+
+        if path.startswith("/flaky/"):
+            # /flaky/<code>/<n>: the first <n> requests for a key answer
+            # <code>, the rest answer 200. `n=-1` never succeeds.
+            parts = path.split("/")
+            code = int(parts[2])
+            fails = int(parts[3]) if len(parts) > 3 else 1
+            key = params.get("key", "default")
+            body = b""
+            if int(self.headers.get("Content-Length") or 0):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+            with STATE_LOCK:
+                seen = ATTEMPTS.get(key, 0) + 1
+                ATTEMPTS[key] = seen
+            if fails < 0 or seen <= fails:
+                extra = {"Retry-After": "0"} if code == 429 else None
+                payload = params.get("payload", "")
+                if payload == "s3slowdown":
+                    return self._send(
+                        code,
+                        b"<?xml version=\"1.0\"?><Error><Code>SlowDown</Code>"
+                        b"<Message>Please reduce your request rate.</Message>"
+                        b"</Error>",
+                        "application/xml",
+                        extra,
+                    )
+                return self._send(
+                    code, b"transient failure %d" % seen,
+                    "text/plain", extra,
+                )
+            return self._send(
+                200,
+                ("attempts=%d\nmethod=%s\nidem=%s\nbody-len=%d\n" % (
+                    seen, self.command,
+                    self.headers.get("Idempotency-Key", ""), len(body),
+                )).encode("ascii"),
+                "text/plain",
+            )
+
+        if path == "/attempts":
+            with STATE_LOCK:
+                seen = ATTEMPTS.get(params.get("key", "default"), 0)
+            return self._send(
+                200, ("attempts=%d\n" % seen).encode("ascii"), "text/plain"
+            )
 
         if path.startswith("/slow"):
             time.sleep(int(params.get("ms", "1000")) / 1000.0)
