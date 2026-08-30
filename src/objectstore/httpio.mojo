@@ -13,10 +13,11 @@ sliced locally, so the caller always gets the bytes it asked for.
 """
 
 from .http import Header, HttpClient, Response
+from .ranges import ByteRange, RangeReader, read_ranges_coalesced
 
 
 @fieldwise_init
-struct HttpInputFile(Copyable, Movable):
+struct HttpInputFile(RangeReader, Copyable, Movable):
     var url: String
     var client: HttpClient
     var headers: List[Header]
@@ -110,6 +111,19 @@ struct HttpInputFile(Copyable, Movable):
         var out = List[UInt8](capacity=end - start)
         out.extend(Span(r.body)[start:end])
         return out^
+
+    def read_ranges(
+        self, ranges: List[ByteRange]
+    ) raises -> List[List[UInt8]]:
+        """One request per *group* of nearby ranges rather than one per range.
+
+        Connection reuse made a request cheap; this makes it rare. A Parquet
+        row group whose column chunks are laid out consecutively becomes a
+        single `Range` request, and the bytes of the columns the scan skipped
+        are read and thrown away — which is cheaper than the round trip that
+        would have avoided them.
+        """
+        return read_ranges_coalesced(self, ranges)
 
 
 @fieldwise_init

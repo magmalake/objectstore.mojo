@@ -31,6 +31,12 @@ from .http import Header, HttpClient
 from .httpio import HttpInputFile, HttpOutputFile, http_delete
 from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
 from .path import Uri, parse_uri
+from .ranges import (
+    ByteRange,
+    DEFAULT_COALESCE_GAP,
+    RangeReader,
+    read_ranges_coalesced,
+)
 from .s3 import S3Client, S3Config, split_s3_uri
 
 
@@ -61,6 +67,22 @@ trait InputFile(Copyable, Movable):
 
     def read_range(self, offset: Int, length: Int) raises -> List[UInt8]:
         ...
+
+    def read_ranges(
+        self, ranges: List[ByteRange]
+    ) raises -> List[List[UInt8]]:
+        """Several ranges at once, in the order asked for.
+
+        The default is one `read_range` per range, which is exactly right for
+        a file the process can seek. Backends where a range costs a round trip
+        override it to coalesce (see `objectstore.ranges`), which is what
+        turns a Parquet scan's per-column-chunk reads into a handful of
+        requests.
+        """
+        var out = List[List[UInt8]]()
+        for k in range(len(ranges)):
+            out.append(self.read_range(ranges[k].offset, ranges[k].length))
+        return out^
 
 
 trait OutputFile(Copyable, Movable):
@@ -119,7 +141,7 @@ a URL plus headers — a bearer token for GCS, a SAS query string and
 open files themselves are `HttpInputFile`/`HttpOutputFile`."""
 
 
-struct AnyInputFile(InputFile, Copyable, Movable):
+struct AnyInputFile(InputFile, RangeReader, Copyable, Movable):
     """An `InputFile` whose backend is chosen at runtime by URI scheme."""
 
     var backend: Int
@@ -182,6 +204,19 @@ struct AnyInputFile(InputFile, Copyable, Movable):
         return self._s3.get_object(
             self._bucket, self._key, offset, offset + length - 1
         )
+
+    def read_ranges(
+        self, ranges: List[ByteRange]
+    ) raises -> List[List[UInt8]]:
+        """Coalesced for HTTP and S3, one seek per range for local files."""
+        if self.backend == BACKEND_LOCAL:
+            var out = List[List[UInt8]]()
+            for k in range(len(ranges)):
+                out.append(
+                    self._local.read_range(ranges[k].offset, ranges[k].length)
+                )
+            return out^
+        return read_ranges_coalesced(self, ranges)
 
 
 struct AnyOutputFile(OutputFile, Copyable, Movable):
@@ -545,6 +580,16 @@ struct FileIOResolver(Copyable, Movable):
         64 KiB for the footer, then exactly the row groups the scan needs.
         """
         return self.new_input(location).read_range(offset, length)
+
+    def read_ranges(
+        self, location: String, ranges: List[ByteRange]
+    ) raises -> List[List[UInt8]]:
+        """Several ranges of one object, coalesced where that saves requests.
+
+        One `new_input` for the lot, so an S3 location is signed and addressed
+        once rather than once per range.
+        """
+        return self.new_input(location).read_ranges(ranges)
 
     def read_text(self, location: String) raises -> String:
         var data = self.new_input(location).read_all()

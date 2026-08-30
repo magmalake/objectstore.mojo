@@ -6,7 +6,8 @@ Modules: `http` (a libcurl-backed client, because no Mojo HTTP package
 resolves from conda), `crypto` (SHA-256/HMAC, because nothing provides them
 and SigV4 is made of them), `sigv4`, `path` (URI handling), `fileio` (the
 `InputFile`/`OutputFile`/`FileIO` traits and the scheme resolver), `local`,
-`httpio`, `s3`, and — over SAS/bearer URLs only — `gcs` and `azure`.
+`ranges` (coalescing many byte ranges into few requests), `httpio`, `s3`, and
+— over SAS/bearer URLs only — `gcs` and `azure`.
 """
 
 from .azure import AzureClient, AzureConfig, parse_azure_uri
@@ -28,10 +29,27 @@ from .fileio import (
     StorageCredential,
 )
 from .gcs import GcsClient, GcsConfig, split_gcs_uri
-from .http import Header, HttpClient, Response, curl_version
+from .http import (
+    Header,
+    HttpClient,
+    Response,
+    RetryPolicy,
+    curl_version,
+    free_connection_pool,
+    new_connection_pool,
+    pool_stats,
+)
 from .httpio import HttpInputFile, HttpOutputFile
 from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
 from .path import Uri, basename, join, parent, parse_uri, url_encode
+from .ranges import (
+    ByteRange,
+    CoalescedPlan,
+    DEFAULT_COALESCE_GAP,
+    RangeReader,
+    plan_ranges,
+    read_ranges_coalesced,
+)
 from .s3 import (
     ListResult,
     ObjectInfo,

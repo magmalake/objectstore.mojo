@@ -60,6 +60,12 @@ from objectstore.local import (
     local_delete,
     local_list,
 )
+from objectstore.ranges import (
+    ByteRange,
+    DEFAULT_COALESCE_GAP,
+    plan_ranges,
+    read_ranges_coalesced,
+)
 from objectstore.path import (
     basename,
     join,
@@ -568,6 +574,140 @@ def test_http_dedicated_pool() raises:
     assert_equal(stats[0], 5)
     assert_equal(stats[1], 1)
     free_connection_pool(pool)
+
+
+# ---------------------------------------------------------------------------
+# Range coalescing
+# ---------------------------------------------------------------------------
+
+
+def _digits(offset: Int, length: Int) -> String:
+    """What `www/digits.txt` holds at `[offset, offset+length)`."""
+    var out = List[UInt8](capacity=length)
+    for i in range(offset, offset + length):
+        out.append(UInt8(48 + i % 10))
+    return String(StringSlice(unsafe_from_utf8=Span(out)))
+
+
+def test_plan_ranges() raises:
+    var near = List[ByteRange]()
+    near.append(ByteRange(0, 100))
+    near.append(ByteRange(100, 100))  # adjacent
+    near.append(ByteRange(1200, 50))  # 1000 bytes on
+    var plan = plan_ranges(near, 1024)
+    assert_equal(len(plan.fetches), 1)
+    assert_equal(plan.fetches[0].offset, 0)
+    assert_equal(plan.fetches[0].length, 1250)
+    assert_equal(plan.group_offset[2], 1200)
+    assert_equal(plan.requests_saved(3), 2)
+
+    # The same ranges with a gap too small to bridge the hole.
+    var split = plan_ranges(near, 512)
+    assert_equal(len(split.fetches), 2)
+    assert_equal(split.fetches[0].length, 200)
+    assert_equal(split.fetches[1].offset, 1200)
+    assert_equal(split.group[2], 1)
+    assert_equal(split.group_offset[2], 0)
+
+    # Out of order in, original order out — a footer asked for last is
+    # answered last even though it is fetched first.
+    var jumbled = List[ByteRange]()
+    jumbled.append(ByteRange(900, 100))
+    jumbled.append(ByteRange(0, 100))
+    jumbled.append(ByteRange(400, 100))
+    var jp = plan_ranges(jumbled, DEFAULT_COALESCE_GAP)
+    assert_equal(len(jp.fetches), 1)
+    assert_equal(jp.fetches[0].offset, 0)
+    assert_equal(jp.fetches[0].length, 1000)
+    assert_equal(jp.group_offset[0], 900)
+    assert_equal(jp.group_offset[1], 0)
+    assert_equal(jp.group_offset[2], 400)
+
+    # Overlapping ranges are one fetch, not two, and neither is stretched.
+    var overlap = List[ByteRange]()
+    overlap.append(ByteRange(0, 100))
+    overlap.append(ByteRange(50, 20))
+    var op = plan_ranges(overlap, 0)
+    assert_equal(len(op.fetches), 1)
+    assert_equal(op.fetches[0].length, 100)
+
+    # A suffix range has no known position, so it is left on its own.
+    var suffix = List[ByteRange]()
+    suffix.append(ByteRange(0, 10))
+    suffix.append(ByteRange(-5, 5))
+    suffix.append(ByteRange(20, 0))
+    var sp = plan_ranges(suffix, DEFAULT_COALESCE_GAP)
+    assert_equal(len(sp.fetches), 1)
+    assert_equal(sp.group[1], -1)
+    assert_equal(sp.group[2], -1)
+
+    assert_equal(len(plan_ranges(List[ByteRange]()).fetches), 0)
+
+
+def test_http_read_ranges_coalesce() raises:
+    """Six ranges, one request — and the same bytes as six requests."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_http_read_ranges_coalesce: no server")
+        return
+    var f = HttpInputFile(base + "/files/digits.txt")
+    var want = List[ByteRange]()
+    want.append(ByteRange(10, 10))
+    want.append(ByteRange(37, 13))
+    want.append(ByteRange(1000, 8))
+    want.append(ByteRange(1008, 8))
+    want.append(ByteRange(5000, 20))
+    want.append(ByteRange(3, 4))
+
+    reset_pool_stats()
+    var got = f.read_ranges(want)
+    var stats = pool_stats()
+    assert_equal(len(got), 6)
+    for k in range(len(want)):
+        assert_equal(
+            String(StringSlice(unsafe_from_utf8=Span(got[k]))),
+            _digits(want[k].offset, want[k].length),
+        )
+    if shim_abi() >= 2:
+        assert_equal(stats[0], 1)
+
+    # A 64-byte gap splits them into three groups — the three clusters at 3,
+    # at 1000 and at 5000 — and the bytes are identical either way.
+    reset_pool_stats()
+    var split = read_ranges_coalesced(f, want, 64)
+    assert_equal(len(split), 6)
+    for k in range(len(want)):
+        assert_equal(
+            String(StringSlice(unsafe_from_utf8=Span(split[k]))),
+            _digits(want[k].offset, want[k].length),
+        )
+    if shim_abi() >= 2:
+        assert_equal(pool_stats()[0], 3)
+
+
+def test_resolver_read_ranges() raises:
+    """The resolver's `read_ranges` over a local file — the default loop."""
+    var dir = getenv("OBJECTSTORE_TEST_DIR", "")
+    if dir == "":
+        print("SKIP test_resolver_read_ranges: OBJECTSTORE_TEST_DIR unset")
+        return
+    var path = dir + "/ranges.bin"
+    var data = List[UInt8](capacity=4096)
+    for i in range(4096):
+        data.append(UInt8(i % 256))
+    LocalOutputFile(path).overwrite(Span(data))
+
+    var io = FileIOResolver()
+    var want = List[ByteRange]()
+    want.append(ByteRange(0, 16))
+    want.append(ByteRange(2048, 16))
+    want.append(ByteRange(4080, 16))
+    var got = io.read_ranges(String("file://") + path, want)
+    assert_equal(len(got), 3)
+    assert_equal(got[0][0], data[0])
+    assert_equal(got[1][0], data[2048])
+    assert_equal(got[2][15], data[4095])
+    local_delete(path)
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1541,50 @@ def test_s3_multipart_via_resolver() raises:
     var loc = String("s3://") + _s3_bucket() + "/multipart/resolver.bin"
     io.write(loc, Span(data))
     assert_equal(sha256_hex(Span(io.read_all(loc))), sha256_hex(Span(data)))
+    io.delete(loc)
+
+
+def test_s3_read_ranges_coalesce() raises:
+    """A Parquet-shaped read against MinIO: many chunks, few requests."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_read_ranges_coalesce: no S3 server")
+        return
+    var io = FileIOResolver()
+    io.set(String("s3.endpoint"), _s3_endpoint())
+    io.set(String("s3.access-key-id"), getenv("AWS_ACCESS_KEY_ID", ""))
+    io.set(String("s3.secret-access-key"), getenv("AWS_SECRET_ACCESS_KEY", ""))
+    io.set(String("s3.region"), String("us-east-1"))
+
+    var n = 256 * 1024
+    var data = List[UInt8](capacity=n)
+    for i in range(n):
+        data.append(UInt8((i * 17 + 7) % 251))
+    var loc = String("s3://") + _s3_bucket() + "/ranges/chunks.bin"
+    io.write(loc, Span(data))
+
+    # Eight "column chunks", consecutive but for the columns skipped between.
+    var want = List[ByteRange]()
+    for k in range(8):
+        want.append(ByteRange(k * 16 * 1024, 4096))
+    # …and the footer, asked for last, as a Parquet reader would.
+    want.append(ByteRange(n - 1024, 1024))
+
+    var f = io.new_input(loc)
+    reset_pool_stats()
+    var got = f.read_ranges(want)
+    var requests = pool_stats()[0]
+    assert_equal(len(got), 9)
+    for k in range(len(want)):
+        assert_equal(len(got[k]), want[k].length)
+        assert_equal(got[k][0], data[want[k].offset])
+        assert_equal(
+            got[k][want[k].length - 1],
+            data[want[k].offset + want[k].length - 1],
+        )
+    if shim_abi() >= 2:
+        # All nine spans fall inside one 256 KiB window, so one GET answers
+        # them; nine separate `read_range` calls would be nine.
+        assert_equal(requests, 1)
     io.delete(loc)
 
 
