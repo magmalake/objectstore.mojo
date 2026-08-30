@@ -11,7 +11,7 @@ test loop.
 from std.sys import argv
 
 from objectstore.fileio import FileIOResolver
-from objectstore.http import curl_version
+from objectstore.http import curl_version, shim_abi
 from objectstore.local import local_input
 from objectstore.path import parse_uri
 from objectstore.s3 import S3Client, S3Config, split_s3_uri
@@ -29,7 +29,7 @@ usage:
   objectstore-mojo rm <uri>                   delete an object
   objectstore-mojo stat <uri>                 existence and length
   objectstore-mojo presign <s3-uri> [secs]    a presigned GET URL
-  objectstore-mojo version                    libcurl build info
+  objectstore-mojo version                    tin, shim ABI, libcurl build
 
 Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
 AWS_SESSION_TOKEN / AWS_REGION / AWS_ENDPOINT_URL_S3."""
@@ -49,6 +49,10 @@ def main() raises:
     var io = FileIOResolver()
 
     if cmd == "version":
+        # The shim ABI is worth printing: a consumer whose lock file pins an
+        # older objectstore-shim gets 1 and no connection reuse, and nothing
+        # else would tell it so.
+        print("objectstore.mojo 0.2.0, shim ABI", shim_abi())
         print(curl_version())
         return
 

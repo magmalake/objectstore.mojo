@@ -11,9 +11,11 @@ from std.os import getenv
 from std.time import monotonic
 
 from objectstore.crypto import sha256
+from objectstore.fileio import FileIOResolver
 from objectstore.http import HttpClient, Header, curl_version
 from objectstore.httpio import HttpInputFile
 from objectstore.local import LocalInputFile, LocalOutputFile, local_delete
+from objectstore.ranges import ByteRange
 from objectstore.s3 import S3Client, S3Config
 
 
@@ -93,6 +95,19 @@ def main() raises:
     t1 = monotonic()
     _per_request("http read_range x200", 200, total, t1 - t0)
 
+    # The same 200 spans asked for at once: adjacent, so they coalesce into a
+    # single request. This is the shape a Parquet scan actually has.
+    var spans = List[ByteRange]()
+    for k in range(200):
+        spans.append(ByteRange(k * 64 * 1024, 64 * 1024))
+    t0 = monotonic()
+    var pieces = hf.read_ranges(spans)
+    t1 = monotonic()
+    total = 0
+    for k in range(len(pieces)):
+        total += len(pieces[k])
+    _per_request("http read_ranges x200", 200, total, t1 - t0)
+
     # ── S3 / MinIO ─────────────────────────────────────────────────────────
     # The same 200-range pattern, but signed and against a real object store:
     # this is the number an Iceberg scan actually pays.
@@ -119,6 +134,19 @@ def main() raises:
             )
         t1 = monotonic()
         _per_request("s3   read_range x200", 200, total, t1 - t0)
+
+        var s3_spans = List[ByteRange]()
+        for k in range(200):
+            s3_spans.append(ByteRange(k * 64 * 1024, 64 * 1024))
+        var io = FileIOResolver()
+        var s3_file = io.new_input(String("s3://") + bucket + "/" + key)
+        t0 = monotonic()
+        var s3_pieces = s3_file.read_ranges(s3_spans)
+        t1 = monotonic()
+        total = 0
+        for k in range(len(s3_pieces)):
+            total += len(s3_pieces[k])
+        _per_request("s3   read_ranges x200", 200, total, t1 - t0)
 
         t0 = monotonic()
         var whole = client.get_object(bucket, key)

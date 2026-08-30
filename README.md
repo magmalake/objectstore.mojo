@@ -65,6 +65,14 @@ buffer ownership never straddles the boundary. Headers cross as one
 LF-separated blob of `Name: Value` lines, which is lossless (an HTTP header
 value cannot contain a bare LF) and spares the Mojo side a `char*[]`.
 
+Since 0.2 the curl handle **persists** between requests, in an opaque client
+(`os_http_client_new` / `_free`, taken by `os_http_request_ex`) — see
+[Connection reuse](#connection-reuse). `os_http_request` keeps its 0.1
+signature and now means "on the process-wide client", because a consumer's
+lock file can pin an older `objectstore-shim` build while it compiles against
+newer Mojo sources; `os_http_shim_abi()` returns 1 for the old shim and 2 for a
+pooling one.
+
 Defaults, and why:
 
 | Default | Reason |
@@ -83,14 +91,15 @@ is an error.
 
 | Module | What it is |
 |---|---|
-| `http.mojo` + `shim/` | `HttpClient` (`get`/`put`/`post`/`delete`/`head`), `Response{status, headers, body}`, custom headers, `Range`, timeouts |
+| `http.mojo` + `shim/` | `HttpClient` (`get`/`put`/`post`/`delete`/`head`), `Response{status, headers, body}`, custom headers, `Range`, timeouts, pooled connections, `RetryPolicy` |
 | `crypto.mojo` | SHA-256 and HMAC-SHA256, pure Mojo, plus hex |
 | `sigv4.mojo` | AWS Signature V4: canonical request, string to sign, signing key, header and query flavours |
+| `ranges.mojo` | `ByteRange` and the plan that coalesces many nearby ranges into few requests |
 | `path.mojo` | URI parsing (`scheme://bucket/key`, `file:///…`, bare paths), `join`, `parent`, `basename`, RFC 3986 encoding |
 | `fileio.mojo` | the `InputFile` / `OutputFile` / `FileIO` traits, `AnyInputFile`/`AnyOutputFile`, and `FileIOResolver` |
 | `local.mojo` | the filesystem backend, with real `seek`-based range reads |
 | `httpio.mojo` | read-only `InputFile` over `http(s)://` — `HEAD` for length, `Range` for reads |
-| `s3.mojo` | `get_object` (ranged), `put_object`, `head_object`, `delete_object`, paginated `list_objects_v2`, presigning, and a small XML reader |
+| `s3.mojo` | `get_object` (ranged), `put_object` (multipart above a threshold), `head_object`, `delete_object`, paginated `list_objects_v2`, presigning, and a small XML reader |
 | `gcs.mojo` | GCS over its **S3-compatible XML endpoint**, authenticated with a caller-supplied OAuth2 bearer token |
 | `azure.mojo` | Azure Blob through **SAS-token URLs** |
 | `src/main.mojo` | the `objectstore-mojo` CLI |
@@ -203,6 +212,144 @@ The signed `Host` omits a default port (`:443` on https, `:80` on http) because
 that is what curl actually sends; signing it produces a `SignatureDoesNotMatch`
 that looks like a credential problem.
 
+## Connection reuse
+
+Every request used to create and destroy a libcurl easy handle, so every
+request paid a fresh TCP and TLS handshake. That is the whole of the old
+2.9 ms; the bytes were never the problem.
+
+The handle now lives in the shim and persists. `curl_easy_reset` between
+requests clears every option (so nothing leaks from the last one) while
+explicitly keeping the live connections, the DNS cache and the TLS session
+cache — which is the entire reason it is worth keeping the handle rather than
+the options. `CURLOPT_TCP_KEEPALIVE` is on, `MAXCONNECTS` is 16 so alternating
+hosts (a REST catalog and an S3 endpoint) do not evict each other, and
+`FORBID_REUSE`/`FRESH_CONNECT` stay off. A process-wide share handle carries
+DNS entries and TLS sessions between clients.
+
+`HttpClient` holds no socket of its own: `pool` names a handle in the shim, and
+`SHARED_POOL` — the default — is the process-wide one. Two `HttpClient` values
+therefore share connections, which is what makes an Iceberg scan that
+constructs a fresh `S3Client` per file cheap. `new_connection_pool()` hands out
+a private one; **the caller owns it** and must `free_connection_pool` it, since
+`HttpClient` is `Copyable` and a copyable owner of a C resource is a double
+free waiting to happen.
+
+Two things this needed:
+
+* **The shim pins itself.** Mojo closes its `OwnedDLHandle` when the value
+  dies, and a loader that honoured the `dlclose` would unmap the pooled
+  connections along with the library, silently turning reuse back into a
+  handshake per request. The shim takes a permanent `dlopen` reference to
+  itself the first time it is called.
+* **Threads.** A pool is **not** thread safe, and neither is the process-wide
+  one. Mojo has no threads today, so this costs nothing and is why the share
+  handle installs no locking callbacks; if that changes, each thread needs its
+  own pool and the share handle needs `CURLSHOPT_LOCKFUNC`.
+
+The tests assert reuse from both ends rather than inferring it from a
+stopwatch: curl's own connection counter (`pool_stats` → `(requests,
+connections)`) and the test server counting the distinct client ports it saw.
+
+## Retries
+
+`RetryPolicy` on `HttpClient`: three retries by default, 100 ms doubling to a
+20 s ceiling, half the window fixed and half jittered. `S3Client.set_max_retries`
+is the shorthand; `client.http.retry` is the policy; `RetryPolicy.none()` is
+the 0.1 behaviour of one request, one answer.
+
+| Retried | Not retried |
+|---|---|
+| transport failures | 4xx other than 429 |
+| 429 | 501, 505 — permanent facts about the server, not weather |
+| 5xx | `POST`/`PATCH` without an `Idempotency-Key` |
+| S3 `SlowDown` and `RequestTimeout`, read out of the error document | anything, once `max_retries` is spent |
+
+Connection reuse makes transport retries *more* valuable, not less: a pooled
+socket that the server closed while it was idle fails on the next write, and
+retrying is the correct answer to a race nobody can avoid.
+
+`RequestTimeout` is why the error document is read at all — AWS returns it as a
+**400**, so status alone would call it final. Only the first bytes of a
+response that already failed are inspected, so this never touches an object
+body.
+
+Idempotency is RFC 9110's: `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and
+`TRACE` can be repeated by definition. `POST` and `PATCH` cannot, and are
+retried **only** when the request carries an `Idempotency-Key` header — the
+caller saying the server can deduplicate it. The header is the trigger rather
+than a flag on the client because the decision belongs to the code that knows
+whether the server honours it. `retry_non_idempotent` is the escape hatch for a
+caller that cannot add a header, and is off.
+
+> **Consumers, note.** A `POST` that carries `Idempotency-Key` is now retried on
+> a 5xx. A caller that would rather be told the state is unknown — because its
+> server does not in fact deduplicate — should set `client.retry =
+> RetryPolicy.none()` on the `HttpClient` it commits with.
+
+A response that survives the last attempt is **returned**, not turned into an
+error: the caller sees the server's own answer.
+
+## Multipart upload
+
+`put_object` switches to `CreateMultipartUpload` / `UploadPart` /
+`CompleteMultipartUpload` when the body is larger than
+`S3Config.multipart_threshold` (8 MiB), in `multipart_part_size` chunks (8 MiB,
+clamped up to S3's 5 MiB floor — a smaller part is rejected at completion,
+*after* the bytes have been sent). Setting the threshold to 0 restores the
+single `PUT`, which is still correct up to S3's 5 GB ceiling.
+
+Nothing about the call changes, so `AnyOutputFile.overwrite` and
+`FileIOResolver.write` get it for free: a Parquet writer should not have to
+know how big its own output turned out to be.
+
+Parts are `Span` slices of the caller's buffer, so the object is never held
+twice — peak memory is the caller's bytes plus one part's SigV4 hashing state.
+Every failure path aborts the upload, because unaborted parts are billed until
+a lifecycle rule collects them, and an abort that itself fails is appended to
+the error rather than swallowed.
+
+Two details that would otherwise bite: `CompleteMultipartUpload` answers 200
+and *then* streams an error, because completion can take minutes and the status
+line has already gone out — so the body is checked; and the completion `POST`
+carries no `Idempotency-Key`, so the retry policy leaves it alone, which is
+right.
+
+`s3.multipart.part-size-bytes` is read from properties, with Iceberg's own name
+and units. Iceberg's `s3.multipart.threshold` is a decimal *factor* of the part
+size, which needs a float parser this module does not have; the threshold
+follows the part size instead, and `S3Config.multipart_threshold` sets it
+directly.
+
+## Reading many ranges at once
+
+A Parquet scan does not read a file, it reads a list of spans: the footer, then
+one span per column chunk of each row group it kept. Locally that is a list of
+seeks and costs nothing. Over HTTP it is a list of *requests*, and even at
+0.15 ms each the useful optimisation is not making them faster but making fewer
+of them.
+
+```mojo
+var spans = List[ByteRange]()
+spans.append(ByteRange(row_group_start, row_group_bytes))
+spans.append(ByteRange(f.length() - 65536, 65536))   # the footer, asked last
+var chunks = f.read_ranges(spans)                     # answered in that order
+```
+
+`InputFile.read_ranges` is on the trait with a **default that loops**, which is
+exactly right for a file the process can seek and means nothing that already
+conforms has to change. HTTP and S3 override it: `objectstore.ranges` groups
+ranges that are adjacent, overlapping, or within `max_gap` (1 MiB) of each
+other, fetches the groups, and slices the caller's ranges back out. Column
+chunks of one row group are laid out consecutively, so a scan's reads collapse
+to a handful of requests and the columns it skipped are read and thrown away —
+cheaper than the round trip that would have avoided them. The waste is bounded
+by `max_gap` per join.
+
+Input order is preserved, a suffix range (`offset < 0`) is left on its own
+because where it lands is not known until the length is, and a short read is
+truncated rather than sliced past the end.
+
 ## GCS and Azure
 
 Both are implemented, and both are deliberately narrow: they cover the case
@@ -241,41 +388,52 @@ vends, and the listing documents.
 
 * **GCS service-account JWT signing (RSA)** and **Azure `SharedKey` / Entra
   ID.** See above: both backends require a credential the caller already has.
-* **Multipart upload.** `put_object` is a single `PUT`. Tested to 20 MB; S3's
-  single-PUT ceiling is 5 GB. Iceberg data files are usually well under that,
-  but a writer that needs more will need multipart.
-* **Retries and backoff.** One request, one answer. A `Response` with a 503 is
-  returned, not retried.
-* **Connection reuse.** Each request is a fresh libcurl easy handle, so each is
-  a fresh TCP and TLS handshake. That costs about 3 ms per request on loopback
-  and rather more against a real endpoint; a shared multi handle is the obvious
-  next optimisation.
 * **`s3.signer` / remote signing.** The REST spec's `remote-signing` delegation
-  mode is not implemented; `vended-credentials` is.
+  mode — `POST …/v1/{prefix}/s3-sign/{routing}`, where the catalog signs each
+  request instead of vending credentials — is not implemented;
+  `vended-credentials` is. The seam exists: it is a different way of producing
+  the headers `S3Client._signed_headers` builds, so it wants an
+  `S3Client.signer` indirection rather than a new backend.
+* **Parallel or streaming multipart.** Parts go up one at a time from a buffer
+  the caller already holds; there is no upload from a file handle, and no
+  concurrency, because Mojo has no threads.
+* **Concurrent requests.** One connection pool, one request at a time, for the
+  same reason.
 * **Server-side encryption headers, ACLs, versioning, object tagging.**
 * **HDFS and other schemes.** `FileIOResolver.backend_for` raises a clear
   error naming the scheme rather than pretending.
 
 ## Perf
 
-M4, one core, 100 MB, `pixi run bench`:
+M4, one core, 100 MB, `pixi run bench` (which now brings up MinIO too, so the
+signed numbers are against a real object store):
 
-| Operation | Throughput |
-|---|---|
-| local `read_all` | 3400 MB/s |
-| local `read_range` × 1000 (64 KiB each) | 5700 MB/s |
-| HTTP `read_all` (loopback, python server) | 1770 MB/s |
-| HTTP `read_range` × 200 (64 KiB each) | 22 MB/s — ~2.9 ms per request, dominated by connection setup |
-| SHA-256 (what SigV4 costs a signed PUT) | 60 MB/s |
+| Operation | 0.1 | 0.2 |
+|---|---|---|
+| local `read_all` | 3400 MB/s | 3491 MB/s |
+| local `read_range` × 1000 (64 KiB each) | 5700 MB/s | 5774 MB/s |
+| HTTP `read_all` (loopback, python server) | 1770 MB/s | 2220 MB/s |
+| **HTTP `read_range` × 200** (64 KiB each) | **2.85 ms/request**, 22 MB/s | **0.147 ms/request**, 424 MB/s |
+| **MinIO ranged `get_object` × 200** (signed) | **5.91 ms/request**, 11 MB/s | **0.521 ms/request**, 120 MB/s |
+| HTTP `read_ranges` × 200 (coalesced) | — | 0.021 ms/request, 2914 MB/s |
+| MinIO `read_ranges` × 200 (coalesced) | — | 0.027 ms/request, 2304 MB/s |
+| MinIO `put_object`, 16 MB (multipart) | — | 53 MB/s |
+| SHA-256 (what SigV4 costs a signed PUT) | 60 MB/s | 60 MB/s |
+
+**19× on loopback and 11× against MinIO**, and the whole of it is the
+handshake that no longer happens. The two coalescing rows are the same 200
+spans asked for in one call: adjacent, so they become one request, and the
+per-request figure is the total divided by 200 rather than a request that got
+faster.
 
 The HTTP numbers include a single-threaded Python server on the other end, so
-they are a floor, not a ceiling. SHA-256 at 60 MB/s is the scalar reference
-implementation; it only matters for `put_object`, and `sign_payload = False`
-removes it.
+they are a floor, not a ceiling. `put_object` is bounded by SHA-256 at 60 MB/s
+— it is the scalar reference implementation, and `sign_payload = False` removes
+it.
 
 ## Tests
 
-`pixi run test` builds the suite, brings up the servers it needs, runs 43 tests,
+`pixi run test` builds the suite, brings up the servers it needs, runs 58 tests,
 and tears them down:
 
 * SHA-256 and HMAC against FIPS 180-4 and RFC 4231, including the one-million-`a`
@@ -287,10 +445,25 @@ and tears them down:
   Regenerate with `tools/gen_sigv4_vectors.py`;
 * the HTTP client against `tests/http_server.py` — every verb, custom headers,
   ranges (including open-ended and suffix), 404/403/500, and a timeout;
+* **connection reuse**, asserted from both ends: twenty requests, one socket
+  by curl's own counter and one client port by the server's;
+* **retries**, against a route that fails N times and then succeeds and counts
+  the attempts it saw — transient recovery, giving up, 501 left alone, a bare
+  `POST` not repeated, a keyed one repeated, and the two S3 error codes hiding
+  behind a 400;
+* **range coalescing**: the planner (adjacency, gaps, out-of-order input,
+  overlap, suffixes), six HTTP ranges answered by one request and by three at a
+  64-byte gap with identical bytes, and nine S3 "column chunks" plus a footer
+  answered by one `GET`;
 * **S3 end to end against MinIO**: put, get, ranged get, head, list with
-  delimiter and pagination, delete, a 20 MB single-`PUT` object, keys containing
-  spaces and `=`, both addressing styles, a presigned URL read by a client with
-  no credentials, and a wrong-credentials request that MinIO rejects;
+  delimiter and pagination, delete, a 20 MB single-`PUT` object, **multipart at
+  20 MB (three parts) and 40 MB (eight 5 MiB parts)** verified by SHA-256 of
+  the object read back — a part uploaded out of order produces exactly the
+  right size and entirely the wrong contents — plus the `-<parts>` ETag suffix,
+  which is the server itself confirming the upload was multipart, and an
+  aborted upload that cannot then be completed; keys containing spaces and `=`,
+  both addressing styles, a presigned URL read by a client with no credentials,
+  and a wrong-credentials request that MinIO rejects;
 * GCS and Azure URL construction, auth headers, Iceberg property names and
   listing documents, which is everything about those backends that is not the
   network.
@@ -318,6 +491,14 @@ CI for a consumer therefore has to check this repo out next to its own, and the
 `objectstore-shim = { path = "../objectstore.mojo/shim" }` to its dependencies,
 or depend on the `objectstore-mojo` conda package, which pulls the shim in as a
 run dependency.
+
+Those two halves can be **different versions**, because a lock file pins the
+git dependency to a commit while `-I` follows the checkout. So the shim's ABI
+is additive: `os_http_request` still has its 0.1 signature, and 0.2's Mojo
+sources call it for the default pool. A consumer pinned to a 0.1 shim compiles
+and runs unchanged against 0.2 sources — it simply does not get connection
+reuse until it updates the pin. `objectstore.http.shim_abi()` says which it
+has.
 
 ## License
 
