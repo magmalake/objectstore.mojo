@@ -1,5 +1,7 @@
 # objectstore.mojo
 
+[![mojoshelf](https://mojoshelf.org/badge/objectstore-mojo.svg)](https://mojoshelf.org/tins/objectstore-mojo) [![mojo nightly](https://mojoshelf.org/badge/objectstore-mojo/nightly.svg)](https://mojoshelf.org/tins/objectstore-mojo)
+
 Storage and HTTP for Apache Iceberg tables in Mojo: a `FileIO` abstraction over
 local files, HTTP(S) range reads and S3, with the HTTP transport the rest of the
 stack was missing.
