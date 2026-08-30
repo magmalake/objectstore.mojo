@@ -70,6 +70,7 @@ from objectstore.path import (
 )
 from objectstore.s3 import (
     ListResult,
+    MIN_PART_SIZE,
     S3Client,
     S3Config,
     S3Credentials,
@@ -1274,7 +1275,11 @@ def test_s3_large_object() raises:
     if _s3_endpoint() == "":
         print("SKIP test_s3_large_object: no S3 server")
         return
-    var c = _s3_client()
+    var config = S3Config.from_env()
+    # Force the single-`PUT` path: 20 MB is over the multipart threshold now,
+    # and S3 takes a single PUT up to 5 GB, so this half still has to work.
+    config.multipart_threshold = 0
+    var c = S3Client(config^)
     var bucket = _s3_bucket()
     var key = String("large/20mb.bin")
     var n = 20 * 1024 * 1024
@@ -1282,7 +1287,6 @@ def test_s3_large_object() raises:
     for i in range(n):
         data.append(UInt8(i % 251))
 
-    # 20 MB in a single PUT — no multipart, which is deliberate (see README).
     c.put_object(bucket, key, Span(data))
     assert_equal(c.object_length(bucket, key), n)
     var tail = c.get_object(bucket, key, n - 16, n - 1)
@@ -1292,6 +1296,112 @@ def test_s3_large_object() raises:
     assert_equal(len(whole), n)
     assert_equal(whole[n - 1], data[n - 1])
     c.delete_object(bucket, key)
+
+
+def test_s3_multipart_upload() raises:
+    """20 MB and 40 MB through `CreateMultipartUpload`/`UploadPart`/`Complete`.
+
+    Verified by hash rather than by length: a part uploaded out of order, or a
+    part list assembled wrong, produces an object of exactly the right size and
+    entirely the wrong contents.
+    """
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_multipart_upload: no S3 server")
+        return
+    var c = _s3_client()
+    var bucket = _s3_bucket()
+
+    # ── 20 MB with the default 8 MiB parts: three parts, the last short ────
+    var n = 20 * 1024 * 1024
+    var data = List[UInt8](capacity=n)
+    for i in range(n):
+        data.append(UInt8((i * 7 + 3) % 251))
+    var key = String("multipart/20mb.bin")
+    c.put_object(bucket, key, Span(data), String("application/octet-stream"))
+
+    assert_equal(c.object_length(bucket, key), n)
+    var digest = sha256_hex(Span(data))
+    assert_equal(sha256_hex(Span(c.get_object(bucket, key))), digest)
+    # A multipart object's ETag is a digest of the part digests plus `-<parts>`,
+    # which is how the server itself says the upload really was multipart.
+    var etag = c.head_object(bucket, key).header("ETag")
+    assert_true(etag.find("-3") > 0)
+    # Ranges still address the assembled object, not a part.
+    var mid = c.get_object(bucket, key, 9 * 1024 * 1024, 9 * 1024 * 1024 + 15)
+    assert_equal(len(mid), 16)
+    assert_equal(mid[0], data[9 * 1024 * 1024])
+    c.delete_object(bucket, key)
+
+    # ── 40 MB in 5 MiB parts: eight of them, the minimum S3 allows ─────────
+    var big_n = 40 * 1024 * 1024
+    var big = List[UInt8](capacity=big_n)
+    for i in range(big_n):
+        big.append(UInt8((i * 13 + 101) % 251))
+    var big_config = S3Config.from_env()
+    big_config.multipart_part_size = 5 * 1024 * 1024
+    big_config.multipart_threshold = 5 * 1024 * 1024
+    var big_client = S3Client(big_config^)
+    var big_key = String("multipart/40mb.bin")
+    big_client.put_object(bucket, big_key, Span(big))
+
+    assert_equal(big_client.object_length(bucket, big_key), big_n)
+    assert_equal(
+        sha256_hex(Span(big_client.get_object(bucket, big_key))),
+        sha256_hex(Span(big)),
+    )
+    assert_true(
+        big_client.head_object(bucket, big_key).header("ETag").find("-8") > 0
+    )
+    big_client.delete_object(bucket, big_key)
+
+
+def test_s3_multipart_abort() raises:
+    """An abandoned upload can be aborted, and is gone once it has been."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_multipart_abort: no S3 server")
+        return
+    var c = _s3_client()
+    var bucket = _s3_bucket()
+    var key = String("multipart/aborted.bin")
+    var upload_id = c.create_multipart_upload(bucket, key)
+    assert_true(upload_id != "")
+
+    var part = List[UInt8](capacity=MIN_PART_SIZE)
+    for i in range(MIN_PART_SIZE):
+        part.append(UInt8(i % 251))
+    var etag = c.upload_part(bucket, key, upload_id, 1, Span(part))
+    assert_true(etag != "")
+
+    c.abort_multipart_upload(bucket, key, upload_id)
+    # Nothing was ever committed, and the id no longer exists.
+    assert_true(not c.object_exists(bucket, key))
+    var etags = List[String]()
+    etags.append(etag)
+    with assert_raises():
+        c.complete_multipart_upload(bucket, key, upload_id, etags)
+
+
+def test_s3_multipart_via_resolver() raises:
+    """`FileIOResolver.write` picks up multipart without being told."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_multipart_via_resolver: no S3 server")
+        return
+    var io = FileIOResolver()
+    io.set(String("s3.endpoint"), _s3_endpoint())
+    io.set(String("s3.access-key-id"), getenv("AWS_ACCESS_KEY_ID", ""))
+    io.set(String("s3.secret-access-key"), getenv("AWS_SECRET_ACCESS_KEY", ""))
+    io.set(String("s3.region"), String("us-east-1"))
+    # Iceberg's own property name, in Iceberg's own units.
+    io.set(String("s3.multipart.part-size-bytes"), String(MIN_PART_SIZE))
+
+    var n = 12 * 1024 * 1024
+    var data = List[UInt8](capacity=n)
+    for i in range(n):
+        data.append(UInt8((i * 31 + 5) % 251))
+    var loc = String("s3://") + _s3_bucket() + "/multipart/resolver.bin"
+    io.write(loc, Span(data))
+    assert_equal(sha256_hex(Span(io.read_all(loc))), sha256_hex(Span(data)))
+    io.delete(loc)
 
 
 def test_s3_virtual_host_addressing() raises:

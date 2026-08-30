@@ -2,8 +2,8 @@
 
 Covers what an Iceberg reader and writer actually issue: `GetObject` (with
 `Range`, because a Parquet reader wants the footer before anything else),
-`PutObject`, `HeadObject`, `DeleteObject` and a paginated `ListObjectsV2`.
-Multipart upload is deliberately absent — see the README.
+`PutObject` (multipart above a threshold), `HeadObject`, `DeleteObject` and a
+paginated `ListObjectsV2`.
 
 Addressing works both ways. Virtual-host style (`bucket.s3.region.amazonaws.com`)
 is what AWS prefers; path style (`endpoint/bucket/key`) is what MinIO, Ceph and
@@ -36,6 +36,14 @@ from .sigv4 import (
 
 comptime SERVICE = String("s3")
 comptime DEFAULT_REGION = String("us-east-1")
+
+comptime MIN_PART_SIZE = 5 * 1024 * 1024
+"""S3's floor for every part but the last. Not a suggestion: a smaller part is
+rejected at `CompleteMultipartUpload`, after the bytes have been sent."""
+
+comptime DEFAULT_PART_SIZE = 8 * 1024 * 1024
+"""Big enough that a 5 GB object stays inside the 10 000-part limit with room
+to spare, small enough that a failed part is cheap to resend."""
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +81,12 @@ struct S3Config(Copyable, Movable):
     var anonymous: Bool
     """Skip signing entirely: public buckets, and presigned URLs, need no
     credentials and are rejected by some servers if signed anyway."""
+    var multipart_threshold: Int
+    """Objects larger than this go up as a multipart upload. 0 disables
+    multipart entirely, which is the 0.1.x behaviour and still correct up to
+    S3's 5 GB single-`PUT` ceiling."""
+    var multipart_part_size: Int
+    """Bytes per part, clamped up to S3's 5 MiB floor."""
 
     def __init__(out self):
         self.endpoint = ""
@@ -81,6 +95,8 @@ struct S3Config(Copyable, Movable):
         self.credentials = S3Credentials()
         self.sign_payload = True
         self.anonymous = False
+        self.multipart_threshold = DEFAULT_PART_SIZE
+        self.multipart_part_size = DEFAULT_PART_SIZE
 
     def __init__(
         out self,
@@ -90,6 +106,8 @@ struct S3Config(Copyable, Movable):
         var credentials: S3Credentials,
         sign_payload: Bool = True,
         anonymous: Bool = False,
+        multipart_threshold: Int = DEFAULT_PART_SIZE,
+        multipart_part_size: Int = DEFAULT_PART_SIZE,
     ):
         self.endpoint = endpoint^
         self.region = region^
@@ -97,6 +115,8 @@ struct S3Config(Copyable, Movable):
         self.credentials = credentials^
         self.sign_payload = sign_payload
         self.anonymous = anonymous
+        self.multipart_threshold = multipart_threshold
+        self.multipart_part_size = multipart_part_size
 
     @staticmethod
     def from_env() raises -> Self:
@@ -131,8 +151,14 @@ struct S3Config(Copyable, Movable):
         """Iceberg property names, which is what a REST catalog hands back.
 
         Recognised: `s3.endpoint`, `s3.access-key-id`, `s3.secret-access-key`,
-        `s3.session-token`, `s3.region`, `s3.path-style-access`, and
+        `s3.session-token`, `s3.region`, `s3.path-style-access`,
+        `s3.multipart.part-size-bytes` (Iceberg's own name and units), and
         `client.region` as a fallback for the region.
+
+        Iceberg's `s3.multipart.threshold` is a *factor* of the part size
+        expressed as a decimal, which needs a float parser this module does
+        not have; the threshold follows the part size instead, and
+        `S3Config.multipart_threshold` sets it directly.
         """
         var c = Self.from_env()
         if "s3.endpoint" in props:
@@ -150,6 +176,9 @@ struct S3Config(Copyable, Movable):
             c.region = props["client.region"]
         if "s3.path-style-access" in props:
             c.path_style = _truthy(props["s3.path-style-access"])
+        if "s3.multipart.part-size-bytes" in props:
+            c.multipart_part_size = Int(props["s3.multipart.part-size-bytes"])
+            c.multipart_threshold = c.multipart_part_size
         c.anonymous = not c.credentials.is_set()
         return c^
 
@@ -236,6 +265,27 @@ def xml_unescape(s: String) -> String:
                 continue
         out += String(StringSlice(unsafe_from_utf8=Span(b)[i : i + 1]))
         i += 1
+    return out^
+
+
+def xml_escape(s: String) -> String:
+    """The three characters that cannot appear in element text.
+
+    Only `CompleteMultipartUpload` needs this, and only for an ETag, which in
+    practice is hex — but an ETag is server-chosen and this document decides
+    whether a 40 MB upload lands.
+    """
+    var out = String("")
+    var b = s.as_bytes()
+    for k in range(len(b)):
+        if b[k] == 38:  # &
+            out += "&amp;"
+        elif b[k] == 60:  # <
+            out += "&lt;"
+        elif b[k] == 62:  # >
+            out += "&gt;"
+        else:
+            out += String(StringSlice(unsafe_from_utf8=Span(b)[k : k + 1]))
     return out^
 
 
@@ -523,6 +573,19 @@ struct S3Client(Copyable, Movable):
         body: Span[UInt8, _],
         content_type: String = "",
     ) raises:
+        """Stores the object, as one `PUT` or as a multipart upload.
+
+        The switch is `S3Config.multipart_threshold`. Nothing about the call
+        changes: `AnyOutputFile.overwrite` and `FileIOResolver.write` get
+        multipart for free, which is the point — a Parquet writer should not
+        have to know how big its own output turned out to be.
+        """
+        if (
+            self.config.multipart_threshold > 0
+            and len(body) > self.config.multipart_threshold
+        ):
+            self.put_object_multipart(bucket, key, body, content_type)
+            return
         var extra = List[Header]()
         if content_type != "":
             extra.append(Header("Content-Type", content_type))
@@ -540,6 +603,208 @@ struct S3Client(Copyable, Movable):
                 + " "
                 + s3_error_message(r)
             )
+
+    # ── multipart upload ───────────────────────────────────────────────────
+    def create_multipart_upload(
+        self, bucket: String, key: String, content_type: String = ""
+    ) raises -> String:
+        """`POST /key?uploads` — returns the upload id."""
+        var params = List[QueryParam]()
+        params.append(QueryParam("uploads", ""))
+        var extra = List[Header]()
+        if content_type != "":
+            extra.append(Header("Content-Type", content_type))
+        var r = self.request(
+            "POST",
+            bucket,
+            key,
+            params,
+            Span[UInt8, ImmUntrackedOrigin](),
+            extra,
+        )
+        if not r.ok():
+            raise Error(
+                "s3: CreateMultipartUpload "
+                + bucket
+                + "/"
+                + key
+                + ": HTTP "
+                + String(r.status)
+                + " "
+                + s3_error_message(r)
+            )
+        var upload_id = xml_text(r.text(), String("UploadId"))
+        if upload_id == "":
+            raise Error(
+                "s3: CreateMultipartUpload "
+                + bucket
+                + "/"
+                + key
+                + ": no UploadId in "
+                + r.body_excerpt()
+            )
+        return upload_id^
+
+    def upload_part(
+        self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+        part_number: Int,
+        body: Span[UInt8, _],
+    ) raises -> String:
+        """`PUT /key?partNumber=N&uploadId=…` — returns the part's ETag.
+
+        Signed like any other request, so every part pays its own SigV4; with
+        `sign_payload = False` it pays `UNSIGNED-PAYLOAD` instead, which for a
+        multi-hundred-megabyte object over TLS is the difference between
+        hashing the data twice and hashing it once.
+        """
+        var params = List[QueryParam]()
+        # Canonical query is sorted when signing, but the wire order matters
+        # for nothing else, so keep it readable: partNumber sorts first anyway.
+        params.append(QueryParam("partNumber", String(part_number)))
+        params.append(QueryParam("uploadId", upload_id))
+        var r = self.request("PUT", bucket, key, params, body)
+        if not r.ok():
+            raise Error(
+                "s3: UploadPart "
+                + String(part_number)
+                + " of "
+                + bucket
+                + "/"
+                + key
+                + ": HTTP "
+                + String(r.status)
+                + " "
+                + s3_error_message(r)
+            )
+        var etag = r.header("ETag")
+        if etag == "":
+            raise Error(
+                "s3: UploadPart "
+                + String(part_number)
+                + " of "
+                + bucket
+                + "/"
+                + key
+                + ": no ETag"
+            )
+        return etag^
+
+    def complete_multipart_upload(
+        self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+        etags: List[String],
+    ) raises:
+        """`POST /key?uploadId=…` with the part list, in order."""
+        var doc = String("<CompleteMultipartUpload>")
+        for k in range(len(etags)):
+            doc += "<Part><PartNumber>"
+            doc += String(k + 1)
+            doc += "</PartNumber><ETag>"
+            doc += xml_escape(etags[k])
+            doc += "</ETag></Part>"
+        doc += "</CompleteMultipartUpload>"
+
+        var params = List[QueryParam]()
+        params.append(QueryParam("uploadId", upload_id))
+        var r = self.request("POST", bucket, key, params, doc.as_bytes())
+        if not r.ok():
+            raise Error(
+                "s3: CompleteMultipartUpload "
+                + bucket
+                + "/"
+                + key
+                + ": HTTP "
+                + String(r.status)
+                + " "
+                + s3_error_message(r)
+            )
+        # S3 answers 200 and *then* streams an error, because the completion
+        # can take minutes and the status line has already gone out.
+        var text = r.text()
+        if text.find("<Error>") >= 0 or text.find("<Code>") >= 0:
+            raise Error(
+                "s3: CompleteMultipartUpload "
+                + bucket
+                + "/"
+                + key
+                + ": "
+                + s3_error_message(r)
+            )
+
+    def abort_multipart_upload(
+        self, bucket: String, key: String, upload_id: String
+    ) raises:
+        """`DELETE /key?uploadId=…`. Unaborted parts are billed until a
+        lifecycle rule collects them, so this runs on every failure path."""
+        var params = List[QueryParam]()
+        params.append(QueryParam("uploadId", upload_id))
+        var r = self.request("DELETE", bucket, key, params)
+        if not r.ok() and r.status != 404:
+            raise Error(
+                "s3: AbortMultipartUpload "
+                + bucket
+                + "/"
+                + key
+                + ": HTTP "
+                + String(r.status)
+                + " "
+                + s3_error_message(r)
+            )
+
+    def put_object_multipart(
+        self,
+        bucket: String,
+        key: String,
+        body: Span[UInt8, _],
+        content_type: String = "",
+    ) raises:
+        """Create, upload each part, complete — aborting if anything fails.
+
+        Parts are `Span` slices of the caller's buffer, so the object is never
+        held twice: peak memory is the caller's own bytes plus one part's
+        worth of SigV4 hashing state.
+        """
+        var part_size = self.config.multipart_part_size
+        if part_size < MIN_PART_SIZE:
+            part_size = MIN_PART_SIZE
+        var upload_id = self.create_multipart_upload(bucket, key, content_type)
+        var etags = List[String]()
+        var offset = 0
+        var failure = String("")
+        while offset < len(body):
+            var end = offset + part_size
+            if end > len(body):
+                end = len(body)
+            try:
+                etags.append(
+                    self.upload_part(
+                        bucket,
+                        key,
+                        upload_id,
+                        len(etags) + 1,
+                        body[offset:end],
+                    )
+                )
+            except e:
+                failure = String(e)
+                break
+            offset = end
+        if failure == "":
+            try:
+                self.complete_multipart_upload(bucket, key, upload_id, etags)
+                return
+            except e:
+                failure = String(e)
+        try:
+            self.abort_multipart_upload(bucket, key, upload_id)
+        except abort_error:
+            failure += " (abort also failed: " + String(abort_error) + ")"
+        raise Error(failure)
 
     def delete_object(self, bucket: String, key: String) raises:
         var r = self.request("DELETE", bucket, key)
