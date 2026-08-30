@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------------ */
 /* Growable byte buffer                                                      */
@@ -253,6 +254,14 @@ os_http_result *os_http_request(const char *method,
 /* Diagnostics: "libcurl/8.x.y OpenSSL/3.x ..." */
 const char *os_http_curl_version(void) { return curl_version(); }
 
-/* Percent-decoding is not needed on the Mojo side, but URL escaping by curl's
- * own rules is handy for building query strings in tests. */
+/*
+ * Seconds since the Unix epoch. SigV4 stamps every request with a UTC
+ * timestamp and AWS rejects anything more than 15 minutes out of skew, but
+ * Mojo's std.time only exposes a monotonic clock — there is no wall clock in
+ * the standard library at all. Rather than add a second FFI shim for one
+ * libc call, it rides along here: HTTP is the only reason this tin ever needs
+ * to know the time.
+ */
+long long os_time_epoch(void) { return (long long)time(NULL); }
+
 long os_http_shim_abi(void) { return 1; }
