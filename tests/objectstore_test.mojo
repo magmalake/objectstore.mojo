@@ -21,7 +21,21 @@ from objectstore.crypto import (
     sha256_hex,
     to_hex,
 )
-from objectstore.fileio import FileIOResolver, BACKEND_LOCAL, BACKEND_HTTP, BACKEND_S3
+from objectstore.azure import (
+    AzureClient,
+    AzureConfig,
+    BLOB_API_VERSION,
+    parse_azure_uri,
+)
+from objectstore.fileio import (
+    BACKEND_AZURE,
+    BACKEND_GCS,
+    BACKEND_HTTP,
+    BACKEND_LOCAL,
+    BACKEND_S3,
+    FileIOResolver,
+)
+from objectstore.gcs import GcsConfig, split_gcs_uri
 from objectstore.http import Header, HttpClient, header_blob, parse_headers
 from objectstore.httpio import HttpInputFile
 from objectstore.local import (
@@ -39,11 +53,13 @@ from objectstore.path import (
     url_encode,
 )
 from objectstore.s3 import (
+    ListResult,
     S3Client,
     S3Config,
     S3Credentials,
     parse_list_objects,
     split_s3_uri,
+    xml_blocks,
     xml_text,
     xml_unescape,
 )
@@ -652,10 +668,17 @@ def test_resolver_scheme_dispatch() raises:
     assert_equal(io.backend_for(String("s3://b/k")), BACKEND_S3)
     assert_equal(io.backend_for(String("s3a://b/k")), BACKEND_S3)
     assert_equal(io.backend_for(String("https://h/k")), BACKEND_HTTP)
+    assert_equal(io.backend_for(String("gs://b/k")), BACKEND_GCS)
+    assert_equal(io.backend_for(String("gcs://b/k")), BACKEND_GCS)
+    assert_equal(
+        io.backend_for(String("abfss://c@a.dfs.core.windows.net/k")),
+        BACKEND_AZURE,
+    )
+    assert_equal(io.backend_for(String("wasbs://c@a.blob.core.windows.net/k")), BACKEND_AZURE)
     with assert_raises():
-        _ = io.backend_for(String("gs://b/k"))
+        _ = io.backend_for(String("hdfs://nn/k"))
     with assert_raises():
-        _ = io.backend_for(String("abfss://c@a/k"))
+        _ = io.backend_for(String("ftp://h/k"))
 
 
 def test_resolver_rebase() raises:
@@ -735,6 +758,151 @@ def test_resolver_http_input() raises:
     assert_equal(len(f.read_range(0, 5)), 5)
     with assert_raises():
         io.delete(base + "/files/hello.txt")
+
+
+# ---------------------------------------------------------------------------
+# GCS and Azure
+#
+# No live gate exists for either: there is no local emulator in the toolchain
+# and neither takes credentials this repo could hold. What is tested is
+# everything that is not the network — URL construction, the auth headers, the
+# property names a REST catalog vends, and the listing documents — since that
+# is where these backends can actually be wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_gcs_urls_and_auth() raises:
+    var props = Dict[String, String]()
+    props["gcs.oauth2.token"] = "ya29.TOKEN"
+    var c = GcsConfig.from_properties(props)
+    assert_equal(c.endpoint, "https://storage.googleapis.com")
+    assert_equal(
+        c.url_for(String("bkt"), String("a/b c.parquet")),
+        "https://storage.googleapis.com/bkt/a/b%20c.parquet",
+    )
+    var h = c.headers()
+    assert_equal(len(h), 1)
+    assert_equal(h[0].name, "Authorization")
+    assert_equal(h[0].value, "Bearer ya29.TOKEN")
+
+    # Iceberg calls the endpoint override `gcs.service.host`.
+    props["gcs.service.host"] = "https://gcs.test:8443"
+    assert_equal(
+        GcsConfig.from_properties(props).url_for(String("b"), String("k")),
+        "https://gcs.test:8443/b/k",
+    )
+
+    # With no token the requests go out anonymous rather than malformed.
+    assert_equal(len(GcsConfig().headers()), 0)
+
+    var parts = split_gcs_uri(String("gs://bucket/a/b"))
+    assert_equal(parts[0], "bucket")
+    assert_equal(parts[1], "a/b")
+    assert_equal(split_gcs_uri(String("gcs://bucket/k"))[0], "bucket")
+    with assert_raises():
+        _ = split_gcs_uri(String("s3://bucket/k"))
+
+
+def test_gcs_listing_is_s3_shaped() raises:
+    """GCS's XML API answers with S3's `ListBucketResult`, which is the whole
+    reason this backend needs no JSON parser."""
+    var body = String(
+        "<ListBucketResult><Name>b</Name><IsTruncated>false</IsTruncated>"
+        "<Contents><Key>db/t/data/f.parquet</Key><Size>4096</Size></Contents>"
+        "</ListBucketResult>"
+    )
+    var r = parse_list_objects(body)
+    assert_equal(len(r.objects), 1)
+    assert_equal(r.objects[0].key, "db/t/data/f.parquet")
+    assert_equal(r.objects[0].size, 4096)
+    assert_true(not r.is_truncated)
+
+
+def test_azure_uri_parsing() raises:
+    var a = parse_azure_uri(
+        String("abfss://warehouse@acct.dfs.core.windows.net/db/t/m.json")
+    )
+    assert_equal(a.account, "acct")
+    assert_equal(a.container, "warehouse")
+    assert_equal(a.path, "db/t/m.json")
+
+    var w = parse_azure_uri(
+        String("wasbs://c@acct.blob.core.windows.net/x/y")
+    )
+    assert_equal(w.account, "acct")
+    assert_equal(w.container, "c")
+    assert_equal(w.path, "x/y")
+
+    # `az://container/path` leaves the account to the configuration.
+    var bare = parse_azure_uri(String("az://cont/p/q"))
+    assert_equal(bare.account, "")
+    assert_equal(bare.container, "cont")
+    with assert_raises():
+        _ = parse_azure_uri(String("s3://b/k"))
+
+
+def test_azure_sas_urls_and_headers() raises:
+    var props = Dict[String, String]()
+    props["adls.sas-token.acct"] = "sv=2021-12-02&sig=SIGNATURE"
+    var c = AzureConfig.from_properties(props, String("acct"))
+    assert_equal(
+        c.url_for(String("cont"), String("a/b c.parquet")),
+        "https://acct.blob.core.windows.net/cont/a/b%20c.parquet"
+        "?sv=2021-12-02&sig=SIGNATURE",
+    )
+    # The SAS query already begins the query string, so a list request has to
+    # append with `&`, not `?`.
+    assert_true(
+        c.list_url(String("cont"), String("db/"), String("")).find(
+            "?sv=2021-12-02&sig=SIGNATURE&restype=container&comp=list"
+        )
+        > 0
+    )
+    var h = c.headers()
+    assert_equal(len(h), 1)
+    assert_equal(h[0].name, "x-ms-version")
+    assert_equal(h[0].value, BLOB_API_VERSION)
+    # Every Azure PUT must declare the blob type.
+    var wh = c.write_headers()
+    assert_equal(len(wh), 2)
+    assert_equal(wh[1].name, "x-ms-blob-type")
+    assert_equal(wh[1].value, "BlockBlob")
+
+    # An account-specific token beats the generic one.
+    props["adls.sas-token"] = "sig=GENERIC"
+    assert_true(
+        AzureConfig.from_properties(props, String("acct")).url_for(
+            String("c"), String("k")
+        ).find("SIGNATURE")
+        > 0
+    )
+    assert_true(
+        AzureConfig.from_properties(props, String("other")).url_for(
+            String("c"), String("k")
+        ).find("GENERIC")
+        > 0
+    )
+
+    var no_account = AzureConfig()
+    with assert_raises():
+        _ = no_account.base_url()
+
+
+def test_azure_listing_xml() raises:
+    var body = String(
+        "<EnumerationResults><Blobs>"
+        "<Blob><Name>db/t/a.parquet</Name>"
+        "<Properties><Content-Length>128</Content-Length></Properties></Blob>"
+        "<Blob><Name>db/t/b.parquet</Name>"
+        "<Properties><Content-Length>0</Content-Length></Properties></Blob>"
+        "</Blobs><NextMarker /></EnumerationResults>"
+    )
+    var blobs = xml_blocks(body, String("Blob"))
+    assert_equal(len(blobs), 2)
+    assert_equal(xml_text(blobs[0], String("Name")), "db/t/a.parquet")
+    assert_equal(xml_text(blobs[0], String("Content-Length")), "128")
+    # A self-closing `<NextMarker />` must not read as a marker value.
+    assert_equal(xml_text(body, String("NextMarker")), "")
 
 
 # ---------------------------------------------------------------------------

@@ -91,6 +91,8 @@ is an error.
 | `local.mojo` | the filesystem backend, with real `seek`-based range reads |
 | `httpio.mojo` | read-only `InputFile` over `http(s)://` — `HEAD` for length, `Range` for reads |
 | `s3.mojo` | `get_object` (ranged), `put_object`, `head_object`, `delete_object`, paginated `list_objects_v2`, presigning, and a small XML reader |
+| `gcs.mojo` | GCS over its **S3-compatible XML endpoint**, authenticated with a caller-supplied OAuth2 bearer token |
+| `azure.mojo` | Azure Blob through **SAS-token URLs** |
 | `src/main.mojo` | the `objectstore-mojo` CLI |
 
 `crypto.mojo` is here because nothing in the Mojo ecosystem provides SHA-2:
@@ -201,14 +203,44 @@ The signed `Host` omits a default port (`:443` on https, `:80` on http) because
 that is what curl actually sends; signing it produces a `SignatureDoesNotMatch`
 that looks like a credential problem.
 
+## GCS and Azure
+
+Both are implemented, and both are deliberately narrow: they cover the case
+where **someone else has already produced the credential**, which is exactly
+what an Iceberg REST catalog vends.
+
+**GCS** goes through the S3-compatible **XML endpoint**
+(`storage.googleapis.com/<bucket>/<key>`), not the JSON API. The XML API is
+byte-for-byte the S3 protocol for `GET` with `Range`, `PUT`, `DELETE` and
+`ListBucketResult`, so `s3.mojo`'s parser reads the listings unchanged and this
+backend needs no JSON parser at all. Authentication is an OAuth2 bearer token
+passed in as Iceberg's `gcs.oauth2.token`; `gcs.service.host` overrides the
+endpoint. Minting a token from a service-account key needs RS256 JWT signing,
+and **RSA is out of scope** — far more code than SHA-256 was, for something
+`gcloud auth print-access-token`, the metadata server, or the surrounding
+application already has. A caller holding HMAC "interoperability" keys can
+point `S3Client` at `https://storage.googleapis.com` instead and get real
+SigV4.
+
+**Azure Blob** goes through **SAS-token URLs** — the query string Iceberg
+stores as `adls.sas-token.<account>`. `abfs(s)://container@account.dfs…`,
+`wasb(s)://` and `az://container/path` all parse; requests carry `x-ms-version`
+and, on writes, `x-ms-blob-type: BlockBlob`. Azure's own `SharedKey` HMAC
+scheme and Entra ID bearer flows are **not** implemented.
+
+Both reduce, once a location is turned into a URL plus fixed headers, to
+`HttpInputFile` / `HttpOutputFile` — which is why `AnyInputFile` has three
+backends and not five.
+
+Neither has a live gate: there is no emulator in the toolchain and neither
+takes credentials this repo could hold. What is tested is everything that is
+not the network — URL construction, auth headers, the property names a catalog
+vends, and the listing documents.
+
 ## Not implemented
 
-* **GCS and Azure Blob.** Not written. `FileIOResolver.backend_for` raises a
-  clear error for `gs://`, `abfs://` and friends rather than pretending. GCS
-  over the JSON API with a caller-supplied OAuth2 bearer token would be a small
-  addition; service-account JWT signing would need RSA, which is out of scope
-  for the same reason SHA-256 was in it — nothing provides it, and RSA is a lot
-  more code than SHA-256.
+* **GCS service-account JWT signing (RSA)** and **Azure `SharedKey` / Entra
+  ID.** See above: both backends require a credential the caller already has.
 * **Multipart upload.** `put_object` is a single `PUT`. Tested to 20 MB; S3's
   single-PUT ceiling is 5 GB. Iceberg data files are usually well under that,
   but a writer that needs more will need multipart.
@@ -221,6 +253,8 @@ that looks like a credential problem.
 * **`s3.signer` / remote signing.** The REST spec's `remote-signing` delegation
   mode is not implemented; `vended-credentials` is.
 * **Server-side encryption headers, ACLs, versioning, object tagging.**
+* **HDFS and other schemes.** `FileIOResolver.backend_for` raises a clear
+  error naming the scheme rather than pretending.
 
 ## Perf
 
@@ -241,7 +275,7 @@ removes it.
 
 ## Tests
 
-`pixi run test` builds the suite, brings up the servers it needs, runs 38 tests,
+`pixi run test` builds the suite, brings up the servers it needs, runs 43 tests,
 and tears them down:
 
 * SHA-256 and HMAC against FIPS 180-4 and RFC 4231, including the one-million-`a`
@@ -256,7 +290,10 @@ and tears them down:
 * **S3 end to end against MinIO**: put, get, ranged get, head, list with
   delimiter and pagination, delete, a 20 MB single-`PUT` object, keys containing
   spaces and `=`, both addressing styles, a presigned URL read by a client with
-  no credentials, and a wrong-credentials request that MinIO rejects.
+  no credentials, and a wrong-credentials request that MinIO rejects;
+* GCS and Azure URL construction, auth headers, Iceberg property names and
+  listing documents, which is everything about those backends that is not the
+  network.
 
 MinIO rather than moto because **moto does not verify signatures**, which is the
 only thing worth testing there. The runner looks for `$MINIO_BINARY`, then

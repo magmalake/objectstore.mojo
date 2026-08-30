@@ -25,8 +25,10 @@ paths within one table.
 
 from std.collections import Dict
 
+from .azure import AzureClient, AzureConfig, parse_azure_uri
+from .gcs import GcsClient, GcsConfig, split_gcs_uri
 from .http import Header, HttpClient
-from .httpio import HttpInputFile
+from .httpio import HttpInputFile, HttpOutputFile, http_delete
 from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
 from .path import Uri, parse_uri
 from .s3 import S3Client, S3Config, split_s3_uri
@@ -109,6 +111,12 @@ trait FileIO(Copyable, Movable):
 comptime BACKEND_LOCAL = 0
 comptime BACKEND_HTTP = 1
 comptime BACKEND_S3 = 2
+comptime BACKEND_GCS = 3
+comptime BACKEND_AZURE = 4
+"""GCS and Azure reduce to `BACKEND_HTTP` once a location has been turned into
+a URL plus headers — a bearer token for GCS, a SAS query string and
+`x-ms-version` for Azure — so only the resolver distinguishes them. The
+open files themselves are `HttpInputFile`/`HttpOutputFile`."""
 
 
 struct AnyInputFile(InputFile, Copyable, Movable):
@@ -179,14 +187,16 @@ struct AnyInputFile(InputFile, Copyable, Movable):
 struct AnyOutputFile(OutputFile, Copyable, Movable):
     """An `OutputFile` whose backend is chosen at runtime by URI scheme.
 
-    HTTP is read-only here: a plain `PUT` to an arbitrary URL has no agreed
-    semantics for create-vs-overwrite, and the one case that matters —
-    a presigned upload URL — is better served by `HttpClient.put` directly.
+    The HTTP backend covers three cases that all reduce to a single `PUT`: a
+    presigned S3 upload URL, GCS's XML endpoint with a bearer token, and an
+    Azure blob with a SAS token. `create` there is "check, then write", which
+    is racy — HTTP has no atomic create.
     """
 
     var backend: Int
     var uri: String
     var _local: LocalOutputFile
+    var _http: HttpOutputFile
     var _s3: S3Client
     var _bucket: String
     var _key: String
@@ -196,6 +206,7 @@ struct AnyOutputFile(OutputFile, Copyable, Movable):
         backend: Int,
         var uri: String,
         var local: LocalOutputFile,
+        var http: HttpOutputFile,
         var s3: S3Client,
         var bucket: String,
         var key: String,
@@ -203,6 +214,7 @@ struct AnyOutputFile(OutputFile, Copyable, Movable):
         self.backend = backend
         self.uri = uri^
         self._local = local^
+        self._http = http^
         self._s3 = s3^
         self._bucket = bucket^
         self._key = key^
@@ -215,7 +227,7 @@ struct AnyOutputFile(OutputFile, Copyable, Movable):
             return self._local.exists()
         if self.backend == BACKEND_S3:
             return self._s3.object_exists(self._bucket, self._key)
-        raise Error("objectstore: " + self.uri + " is not writable")
+        return self._http.exists()
 
     def create(self, data: Span[UInt8, _]) raises:
         if self.exists():
@@ -229,7 +241,7 @@ struct AnyOutputFile(OutputFile, Copyable, Movable):
         if self.backend == BACKEND_S3:
             self._s3.put_object(self._bucket, self._key, data)
             return
-        raise Error("objectstore: " + self.uri + " is not writable")
+        self._http.overwrite(data)
 
 
 # ---------------------------------------------------------------------------
@@ -342,12 +354,32 @@ struct FileIOResolver(Copyable, Movable):
     def s3_config_for(self, location: String) raises -> S3Config:
         return S3Config.from_properties(self.properties_for(location))
 
+    def gcs_config_for(self, location: String) raises -> GcsConfig:
+        return GcsConfig.from_properties(self.properties_for(location))
+
+    def azure_config_for(
+        self, location: String, account: String
+    ) raises -> AzureConfig:
+        return AzureConfig.from_properties(
+            self.properties_for(location), account
+        )
+
     def backend_for(self, location: String) raises -> Int:
         var u = parse_uri(self.resolve(location))
         if u.scheme == "s3" or u.scheme == "s3a" or u.scheme == "s3n":
             return BACKEND_S3
         if u.scheme == "http" or u.scheme == "https":
             return BACKEND_HTTP
+        if u.scheme == "gs" or u.scheme == "gcs":
+            return BACKEND_GCS
+        if (
+            u.scheme == "abfs"
+            or u.scheme == "abfss"
+            or u.scheme == "wasb"
+            or u.scheme == "wasbs"
+            or u.scheme == "az"
+        ):
+            return BACKEND_AZURE
         if u.scheme == "file":
             return BACKEND_LOCAL
         raise Error(
@@ -356,6 +388,31 @@ struct FileIOResolver(Copyable, Movable):
             + "' in "
             + location
         )
+
+    def _blob_input(self, target: String, backend: Int) raises -> HttpInputFile:
+        """GCS and Azure locations, resolved to a URL plus auth headers."""
+        if backend == BACKEND_GCS:
+            var parts = split_gcs_uri(target)
+            return GcsClient(
+                self.gcs_config_for(target), self.http.copy()
+            ).input(parts[0], parts[1])
+        var az = parse_azure_uri(target)
+        return AzureClient(
+            self.azure_config_for(target, az.account), self.http.copy()
+        ).input(az.container, az.path)
+
+    def _blob_output(
+        self, target: String, backend: Int
+    ) raises -> HttpOutputFile:
+        if backend == BACKEND_GCS:
+            var parts = split_gcs_uri(target)
+            return GcsClient(
+                self.gcs_config_for(target), self.http.copy()
+            ).output(parts[0], parts[1])
+        var az = parse_azure_uri(target)
+        return AzureClient(
+            self.azure_config_for(target, az.account), self.http.copy()
+        ).output(az.container, az.path)
 
     def new_input(self, location: String) raises -> AnyInputFile:
         var target = self.resolve(location)
@@ -367,11 +424,18 @@ struct FileIOResolver(Copyable, Movable):
             var parts = split_s3_uri(target)
             bucket = parts[0]
             key = parts[1]
+        var http_file = HttpInputFile(target, self.http.copy())
+        var open_as = backend
+        if backend == BACKEND_GCS or backend == BACKEND_AZURE:
+            # Both are HTTPS plus fixed headers once the URL is built, so the
+            # open file is an ordinary HttpInputFile.
+            http_file = self._blob_input(target, backend)
+            open_as = BACKEND_HTTP
         return AnyInputFile(
-            backend,
+            open_as,
             target,
             LocalInputFile(u.local_path() if backend == BACKEND_LOCAL else ""),
-            HttpInputFile(target, self.http.copy()),
+            http_file^,
             S3Client(self.s3_config_for(location), self.http.copy()),
             bucket^,
             key^,
@@ -387,10 +451,16 @@ struct FileIOResolver(Copyable, Movable):
             var parts = split_s3_uri(target)
             bucket = parts[0]
             key = parts[1]
+        var http_file = HttpOutputFile(target, List[Header]())
+        var open_as = backend
+        if backend == BACKEND_GCS or backend == BACKEND_AZURE:
+            http_file = self._blob_output(target, backend)
+            open_as = BACKEND_HTTP
         return AnyOutputFile(
-            backend,
+            open_as,
             target,
             LocalOutputFile(u.local_path() if backend == BACKEND_LOCAL else ""),
+            http_file^,
             S3Client(self.s3_config_for(location), self.http.copy()),
             bucket^,
             key^,
@@ -408,6 +478,18 @@ struct FileIOResolver(Copyable, Movable):
                 self.s3_config_for(location), self.http.copy()
             )
             client.delete_object(parts[0], parts[1])
+            return
+        if backend == BACKEND_GCS:
+            var parts = split_gcs_uri(target)
+            GcsClient(
+                self.gcs_config_for(target), self.http.copy()
+            ).delete_object(parts[0], parts[1])
+            return
+        if backend == BACKEND_AZURE:
+            var az = parse_azure_uri(target)
+            AzureClient(
+                self.azure_config_for(target, az.account), self.http.copy()
+            ).delete_blob(az.container, az.path)
             return
         raise Error("objectstore: cannot delete over HTTP: " + location)
 
@@ -428,6 +510,25 @@ struct FileIOResolver(Copyable, Movable):
             var out = List[String]()
             for k in range(len(res.objects)):
                 out.append(String("s3://") + parts[0] + "/" + res.objects[k].key)
+            return out^
+        if backend == BACKEND_GCS:
+            var parts = split_gcs_uri(target)
+            var res = GcsClient(
+                self.gcs_config_for(target), self.http.copy()
+            ).list_all(parts[0], parts[1])
+            var out = List[String]()
+            for k in range(len(res.objects)):
+                out.append(String("gs://") + parts[0] + "/" + res.objects[k].key)
+            return out^
+        if backend == BACKEND_AZURE:
+            var az = parse_azure_uri(target)
+            var blobs = AzureClient(
+                self.azure_config_for(target, az.account), self.http.copy()
+            ).list_blobs(az.container, az.path)
+            var out = List[String]()
+            var head = parse_uri(target).scheme + "://" + parse_uri(target).bucket + "/"
+            for k in range(len(blobs)):
+                out.append(head + blobs[k].name)
             return out^
         raise Error("objectstore: cannot list over HTTP: " + prefix)
 

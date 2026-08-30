@@ -19,27 +19,45 @@ from .http import Header, HttpClient, Response
 struct HttpInputFile(Copyable, Movable):
     var url: String
     var client: HttpClient
+    var headers: List[Header]
+    """Sent with every request. This is what makes the module reusable for
+    GCS (`Authorization: Bearer …`) and Azure (`x-ms-version`) — both reduce
+    to an HTTPS URL plus a fixed set of headers."""
 
     def __init__(out self, var url: String):
         self.url = url^
         self.client = HttpClient()
+        self.headers = []
+
+    def __init__(out self, var url: String, var client: HttpClient):
+        self.url = url^
+        self.client = client^
+        self.headers = []
+
+    def _with(self, var extra: List[Header]) -> List[Header]:
+        var out = List[Header]()
+        for k in range(len(self.headers)):
+            out.append(self.headers[k].copy())
+        for k in range(len(extra)):
+            out.append(extra[k].copy())
+        return out^
 
     def location(self) -> String:
         return self.url
 
     def exists(self) raises -> Bool:
-        var r = self.client.head(self.url)
+        var r = self.client.head(self.url, self.headers.copy())
         if r.ok():
             return True
         if r.status == 404 or r.status == 403 or r.status == 410:
             return False
         # A server that refuses HEAD (405) still says something useful about
         # a one-byte GET.
-        var g = self.client.get(self.url, List[Header](), 0, 0)
+        var g = self.client.get(self.url, self.headers.copy(), 0, 0)
         return g.ok()
 
     def length(self) raises -> Int:
-        var r = self.client.head(self.url)
+        var r = self.client.head(self.url, self.headers.copy())
         if not r.ok():
             raise Error(
                 "objectstore.httpio: HEAD "
@@ -55,7 +73,7 @@ struct HttpInputFile(Copyable, Movable):
         return Int(cl)
 
     def read_all(self) raises -> List[UInt8]:
-        var r = self.client.get(self.url)
+        var r = self.client.get(self.url, self.headers.copy())
         r.raise_for_status("objectstore.httpio: GET " + self.url)
         return r.body.copy()
 
@@ -70,10 +88,10 @@ struct HttpInputFile(Copyable, Movable):
             # open-ended range as `start-`, so this one is sent verbatim.
             var headers = List[Header]()
             headers.append(Header("Range", "bytes=-" + String(length)))
-            r = self.client.get(self.url, headers)
+            r = self.client.get(self.url, self._with(headers^))
         else:
             r = self.client.get(
-                self.url, List[Header](), offset, offset + length - 1
+                self.url, self.headers.copy(), offset, offset + length - 1
             )
         r.raise_for_status("objectstore.httpio: GET " + self.url)
         if r.status == 206:
@@ -92,3 +110,47 @@ struct HttpInputFile(Copyable, Movable):
         var out = List[UInt8](capacity=end - start)
         out.extend(Span(r.body)[start:end])
         return out^
+
+
+@fieldwise_init
+struct HttpOutputFile(Copyable, Movable):
+    """A write-only file behind a single `PUT`.
+
+    Only usable where a plain `PUT` to a URL means "store this object" — a
+    presigned S3 upload URL, GCS's XML endpoint with a bearer token, an Azure
+    blob URL with a SAS token. It is not a general HTTP writer, because HTTP
+    itself has no create-versus-overwrite distinction: `create` is implemented
+    as "check, then write", which is racy and says so.
+    """
+
+    var url: String
+    var client: HttpClient
+    var headers: List[Header]
+
+    def __init__(out self, var url: String, var headers: List[Header]):
+        self.url = url^
+        self.client = HttpClient()
+        self.headers = headers^
+
+    def location(self) -> String:
+        return self.url
+
+    def exists(self) raises -> Bool:
+        return HttpInputFile(self.url, self.client.copy(), self.headers.copy()).exists()
+
+    def create(self, data: Span[UInt8, _]) raises:
+        if self.exists():
+            raise Error("objectstore.httpio: " + self.url + " already exists")
+        self.overwrite(data)
+
+    def overwrite(self, data: Span[UInt8, _]) raises:
+        var r = self.client.put(self.url, data, self.headers.copy())
+        r.raise_for_status("objectstore.httpio: PUT " + self.url)
+
+
+def http_delete(
+    url: String, headers: List[Header], client: HttpClient
+) raises:
+    var r = client.delete(url, headers.copy())
+    if not r.ok() and r.status != 404:
+        r.raise_for_status("objectstore.httpio: DELETE " + url)
