@@ -1,5 +1,5 @@
 name = "objectstore-mojo"
-version = "0.2.0"
-description = "FileIO over local files, HTTP(S) range reads and S3 (SigV4, vended credentials, presigned URLs), with a libcurl-backed HTTP client"
-tags = ["s3", "http", "objectstore", "iceberg", "sigv4", "ffi"]
+version = "0.3.0"
+description = "FileIO over local files, HTTP(S) range reads and S3 (SigV4, vended credentials, presigned URLs, multipart), with a libcurl-backed HTTP client and hardware-accelerated SHA-256"
+tags = ["s3", "http", "objectstore", "iceberg", "sigv4", "ffi", "magmalake", "sha256"]
 tins = []

@@ -94,7 +94,7 @@ is an error.
 | Module | What it is |
 |---|---|
 | `http.mojo` + `shim/` | `HttpClient` (`get`/`put`/`post`/`delete`/`head`), `Response{status, headers, body}`, custom headers, `Range`, timeouts, pooled connections, `RetryPolicy` |
-| `crypto.mojo` | SHA-256 and HMAC-SHA256, pure Mojo, plus hex |
+| `crypto.mojo` | SHA-256 and HMAC-SHA256, pure Mojo, plus hex — with hardware backends (ARMv8 crypto extension, x86 SHA-NI) and a portable scalar fallback |
 | `sigv4.mojo` | AWS Signature V4: canonical request, string to sign, signing key, header and query flavours |
 | `ranges.mojo` | `ByteRange` and the plan that coalesces many nearby ranges into few requests |
 | `path.mojo` | URI parsing (`scheme://bucket/key`, `file:///…`, bare paths), `join`, `parent`, `basename`, RFC 3986 encoding |
@@ -193,9 +193,12 @@ Resolution order for a given location, most specific first: the longest matching
 
 Signing is `AWS4-HMAC-SHA256` with `host`, `x-amz-date` and
 `x-amz-content-sha256` always signed, plus `x-amz-security-token` when a session
-token is present. The payload hash is the real SHA-256 of the body; set
-`S3Config.sign_payload = False` to send `UNSIGNED-PAYLOAD` instead, which is a
-real option for a large object over TLS. **S3 signs the un-normalized path** —
+token is present. The payload hash is the real SHA-256 of the body; the
+`s3.unsigned-payload` property (or `S3Config.sign_payload = False`) sends
+`UNSIGNED-PAYLOAD` instead, which SigV4 permits and which is a real option for
+a large object over TLS. It is **off by default**: it drops the guarantee that
+what S3 stored is what was signed, and now that hashing runs at gigabytes per
+second there is much less to buy. **S3 signs the un-normalized path** —
 `..` is a legal key segment — so path normalization is off for S3 and on only
 where the test vectors ask for it.
 
@@ -386,6 +389,44 @@ takes credentials this repo could hold. What is tested is everything that is
 not the network — URL construction, auth headers, the property names a catalog
 vends, and the listing documents.
 
+## SHA-256, and why it is not scalar any more
+
+SigV4 hashes the whole payload of every signed request, so the compression
+function was the ceiling on upload: at 60 MB/s of SHA-256, a 16 MB multipart
+`put_object` ran at 53 MB/s against a MinIO that will take gigabytes.
+
+`crypto.mojo` now has three backends and picks one at compile time:
+
+| Backend | Instructions | Where |
+|---|---|---|
+| `armv8-crypto` | `sha256h` / `sha256h2` / `sha256su0` / `sha256su1` | every Apple Silicon Mac, every server aarch64 part with the SHA-2 extension |
+| `x86-sha-ni` | `sha256rnds2` / `sha256msg1` / `sha256msg2` | AMD Zen, and Intel from Goldmont / Ice Lake onwards |
+| `scalar` | none | everything else — and it is now 10× the old one, being unrolled over all 64 rounds with a 16-word rolling schedule that keeps every index a compile-time constant |
+
+The choice is a `comptime` query of the *target's* CPU features, and `mojo`
+compiles for the host CPU unless told otherwise, so on any normal build the
+compile-time answer is the run-time truth. `sha256_backend()` reports which one
+is live and `sha256_target_features()` reports the features it saw — both are
+printed by the test suite and by `pixi run bench`, so a CI log says which path
+it exercised.
+
+One wrinkle earned its own code path. On a GitHub `macos-latest` runner `mojo`
+resolves *no* host CPU: the target comes back as baseline aarch64
+(`apple-silicon=0 neon=1 sha2=0`) even though the machine is an arm64 Mac and
+certainly has the extension, and the `llvm.aarch64.crypto.*` intrinsics would
+fail to select. So the same four instructions have a second way in — inline
+assembly under `.arch_extension sha2`, which the assembler accepts whatever the
+target CPU is, at about 4% off the intrinsics. Whether they may actually *run*
+is then a run-time question with a platform-specific answer: on macOS always
+(the crypto extension is mandatory on Apple Silicon), on Linux whatever the
+kernel says through `AT_HWCAP`, otherwise scalar. That path reports itself as
+`armv8-crypto (asm)`.
+
+**OpenSSL is still faster** — 3178 MB/s to our 2700 on the same M4, since
+libcrypto has had hand-written assembly for this for a decade. The point was
+never to beat it. The point was to stop paying a 45× penalty for *not* linking
+it: `objectstore` still has exactly one native dependency, and it is libcurl.
+
 ## Not implemented
 
 * **GCS service-account JWT signing (RSA)** and **Azure `SharedKey` / Entra
@@ -410,36 +451,51 @@ vends, and the listing documents.
 M4, one core, 100 MB, `pixi run bench` (which now brings up MinIO too, so the
 signed numbers are against a real object store):
 
-| Operation | 0.1 | 0.2 |
-|---|---|---|
-| local `read_all` | 3400 MB/s | 3491 MB/s |
-| local `read_range` × 1000 (64 KiB each) | 5700 MB/s | 5774 MB/s |
-| HTTP `read_all` (loopback, python server) | 1770 MB/s | 2220 MB/s |
-| **HTTP `read_range` × 200** (64 KiB each) | **2.85 ms/request**, 22 MB/s | **0.147 ms/request**, 424 MB/s |
-| **MinIO ranged `get_object` × 200** (signed) | **5.91 ms/request**, 11 MB/s | **0.521 ms/request**, 120 MB/s |
-| HTTP `read_ranges` × 200 (coalesced) | — | 0.021 ms/request, 2914 MB/s |
-| MinIO `read_ranges` × 200 (coalesced) | — | 0.027 ms/request, 2304 MB/s |
-| MinIO `put_object`, 16 MB (multipart) | — | 53 MB/s |
-| SHA-256 (what SigV4 costs a signed PUT) | 60 MB/s | 60 MB/s |
+| Operation | 0.1 | 0.2 | 0.3 |
+|---|---|---|---|
+| local `read_all` | 3400 MB/s | 3491 MB/s | 2982 MB/s |
+| local `read_range` × 1000 (64 KiB each) | 5700 MB/s | 5774 MB/s | 5677 MB/s |
+| HTTP `read_all` (loopback, python server) | 1770 MB/s | 2220 MB/s | 1998 MB/s |
+| **HTTP `read_range` × 200** (64 KiB each) | **2.85 ms/request**, 22 MB/s | **0.147 ms/request**, 424 MB/s | 0.142 ms/request, 442 MB/s |
+| **MinIO ranged `get_object` × 200** (signed) | **5.91 ms/request**, 11 MB/s | **0.521 ms/request**, 120 MB/s | 0.502 ms/request, 125 MB/s |
+| HTTP `read_ranges` × 200 (coalesced) | — | 0.021 ms/request, 2914 MB/s | 0.028 ms/request, 2208 MB/s |
+| MinIO `read_ranges` × 200 (coalesced) | — | 0.027 ms/request, 2304 MB/s | 0.030 ms/request, 2092 MB/s |
+| **MinIO `put_object`, 16 MB (multipart)** | — | **53 MB/s** | **409 MB/s** |
+| **SHA-256** (what SigV4 costs a signed request) | 60 MB/s | 60 MB/s | **2700 MB/s** |
+| SHA-256, scalar fallback | 60 MB/s | 60 MB/s | 610 MB/s |
+| SHA-256, OpenSSL `SHA256()` for reference | 3178 MB/s | 3178 MB/s | 3178 MB/s |
+| HMAC-SHA256, 8 KB × 10 000 | — | — | 4.18 µs/op |
 
-**19× on loopback and 11× against MinIO**, and the whole of it is the
-handshake that no longer happens. The two coalescing rows are the same 200
+**19× on loopback and 11× against MinIO** in 0.2, and the whole of it was the
+handshake that no longer happens; **7.7× on multipart upload** in 0.3, and the
+whole of that is the hash. The two coalescing rows are the same 200
 spans asked for in one call: adjacent, so they become one request, and the
 per-request figure is the total divided by 200 rather than a request that got
 faster.
 
 The HTTP numbers include a single-threaded Python server on the other end, so
-they are a floor, not a ceiling. `put_object` is bounded by SHA-256 at 60 MB/s
-— it is the scalar reference implementation, and `sign_payload = False` removes
-it.
+they are a floor, not a ceiling. `put_object` used to be bounded by SHA-256 at
+60 MB/s; it is not any more, and what is left is MinIO and the loopback. The
+SHA-256 row is the backend this machine compiled in (`armv8-crypto`); the two
+rows under it are the portable fallback and OpenSSL, measured on the same
+64 MiB in the same run. OpenSSL is unchanged across versions because it was
+never ours — it is there to say how much is left on the table.
 
 ## Tests
 
-`pixi run test` builds the suite, brings up the servers it needs, runs 58 tests,
+`pixi run test` builds the suite, brings up the servers it needs, runs 62 tests,
 and tears them down:
 
 * SHA-256 and HMAC against FIPS 180-4 and RFC 4231, including the one-million-`a`
   vector fed in chunk sizes that exercise the block-buffering path;
+* **SHA-256 cross-checks, 1000 pseudo-random buffers of 0..10 KB each**, of
+  whichever backend this build compiled in against the portable scalar one
+  *and* against OpenSSL's `SHA256()` — libcrypto is already in the environment
+  as a libcurl dependency, so it is free as a test oracle even though nothing
+  links it. Three fixed vectors would not catch a message-schedule bug that
+  only appears at some particular block count, which is exactly the bug the
+  intrinsics could have. Plus a ragged-chunk streaming check against the
+  one-shot digest;
 * **all 37 usable cases of the published `aws-sig-v4-test-suite`**, checked at
   every stage — canonical request, string to sign, signature.
   `get-header-value-multiline` is excluded: obs-fold header values were removed

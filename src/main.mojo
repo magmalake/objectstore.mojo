@@ -52,7 +52,7 @@ def main() raises:
         # The shim ABI is worth printing: a consumer whose lock file pins an
         # older objectstore-shim gets 1 and no connection reuse, and nothing
         # else would tell it so.
-        print("objectstore.mojo 0.2.0, shim ABI", shim_abi())
+        print("objectstore.mojo 0.3.0, shim ABI", shim_abi())
         print(curl_version())
         return
 
