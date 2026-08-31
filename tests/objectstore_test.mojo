@@ -9,6 +9,7 @@ addressing) runs unconditionally and needs no network at all.
 from std.collections import Dict
 from std.os import getenv, remove
 from std.os.path import exists as path_exists
+from std.ffi import OwnedDLHandle, c_size_t
 from std.testing import TestSuite, assert_equal, assert_raises, assert_true
 
 from sigv4_vectors import sigv4_cases
@@ -18,7 +19,9 @@ from objectstore.crypto import (
     from_hex,
     hmac_sha256,
     sha256,
+    sha256_backend,
     sha256_hex,
+    sha256_scalar,
     to_hex,
 )
 from objectstore.azure import (
@@ -149,6 +152,141 @@ def test_sha256_one_million_a() raises:
         to_hex(Span(h2.digest())),
         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
     )
+
+
+@always_inline
+def _xorshift32(mut state: UInt32) -> UInt32:
+    """A deterministic PRNG, so a failure is reproducible from the seed alone."""
+    var x = state
+    x ^= x << UInt32(13)
+    x ^= x >> UInt32(17)
+    x ^= x << UInt32(5)
+    state = x
+    return x
+
+
+def _random_bytes(mut state: UInt32, n: Int) -> List[UInt8]:
+    var out = List[UInt8](capacity=n)
+    for _ in range(n):
+        out.append(UInt8(Int(_xorshift32(state) & UInt32(0xFF))))
+    return out^
+
+
+@always_inline
+def _digests_equal(a: List[UInt8], b: List[UInt8]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for k in range(len(a)):
+        if a[k] != b[k]:
+            return False
+    return True
+
+
+def test_sha256_hardware_matches_scalar() raises:
+    """Cross-check whichever backend this build compiled in against the
+    portable one, over 1000 pseudo-random buffers of 0..10 KB.
+
+    The FIPS vectors cover three lengths; a message-schedule bug in the
+    hardware path would sail past them and show up only at some particular
+    block count, so the randomized sweep is the test that actually guards the
+    intrinsics. Mismatches are counted and asserted once — `assert_equal` is
+    expensive enough that a thousand of them would dominate the suite.
+    """
+    print("sha256 backend:", sha256_backend())
+    var rng = UInt32(0x9E3779B9)
+    var buf = _random_bytes(rng, 10240)
+    var bad = 0
+    var checked = 0
+    for trial in range(1000):
+        if trial % 100 == 0:
+            buf = _random_bytes(rng, 10240)
+        var n = Int(_xorshift32(rng) % UInt32(10241))
+        var span = Span(buf)[0:n]
+        if not _digests_equal(sha256(span), sha256_scalar(span)):
+            bad += 1
+            print("sha256 != sha256_scalar at length", n)
+        checked += 1
+    assert_equal(checked, 1000)
+    assert_equal(bad, 0)
+
+
+def test_sha256_streaming_matches_one_shot() raises:
+    """The same bytes fed in ragged chunks must hash the same as one call —
+    the multi-block fast path only runs on the whole-blocks remainder, so the
+    held-over partial block is where a streaming bug would hide."""
+    var rng = UInt32(0x12345678)
+    var buf = _random_bytes(rng, 5000)
+    var bad = 0
+    for _ in range(200):
+        var n = Int(_xorshift32(rng) % UInt32(5001))
+        var h = Sha256()
+        var off = 0
+        while off < n:
+            var take = Int(_xorshift32(rng) % UInt32(200)) + 1
+            if off + take > n:
+                take = n - off
+            h.update(Span(buf)[off : off + take])
+            off += take
+        if not _digests_equal(h.digest(), sha256(Span(buf)[0:n])):
+            bad += 1
+            print("streaming != one-shot at length", n)
+    assert_equal(bad, 0)
+
+
+def _libcrypto_path() -> String:
+    """libcrypto ships in this environment as a libcurl dependency. It is a
+    test-only oracle — nothing in `objectstore` links it."""
+    var prefix = getenv("CONDA_PREFIX", "")
+    if prefix == "":
+        return String("")
+    var candidates: List[String] = [
+        String("/lib/libcrypto.3.dylib"),
+        String("/lib/libcrypto.so.3"),
+        String("/lib/libcrypto.dylib"),
+        String("/lib/libcrypto.so"),
+    ]
+    for k in range(len(candidates)):
+        var path = prefix + candidates[k]
+        if path_exists(path):
+            return path^
+    return String("")
+
+
+def test_sha256_matches_openssl() raises:
+    """Cross-check against a second, independent implementation: OpenSSL's
+    `SHA256()`. libcrypto is already in the environment as a libcurl
+    dependency — this is a test-only oracle, nothing in `objectstore` links
+    it."""
+    var path = _libcrypto_path()
+    if path == "":
+        print("SKIP test_sha256_matches_openssl: no libcrypto in CONDA_PREFIX")
+        return
+    var lib = OwnedDLHandle(path)
+    var f = lib.get_function[
+        UnsafePointer[UInt8, MutUntrackedOrigin]
+    ]("SHA256")
+    var rng = UInt32(0xC0FFEE11)
+    var buf = _random_bytes(rng, 10240)
+    var out = List[UInt8](length=32, fill=0)
+    var bad = 0
+    var checked = 0
+    for trial in range(1000):
+        if trial % 100 == 0:
+            buf = _random_bytes(rng, 10240)
+        var n = Int(_xorshift32(rng) % UInt32(10241))
+        _ = f(buf.unsafe_ptr(), c_size_t(n), out.unsafe_ptr())
+        var span = Span(buf)[0:n]
+        if not _digests_equal(sha256(span), out):
+            bad += 1
+            print("sha256 != OpenSSL at length", n)
+        if not _digests_equal(sha256_scalar(span), out):
+            bad += 1
+            print("sha256_scalar != OpenSSL at length", n)
+        checked += 1
+    assert_equal(checked, 1000)
+    assert_equal(bad, 0)
+    _ = buf^
+    _ = out^
 
 
 def test_hmac_sha256_rfc4231() raises:

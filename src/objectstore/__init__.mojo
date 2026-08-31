@@ -16,7 +16,9 @@ from .crypto import (
     from_hex,
     hmac_sha256,
     sha256,
+    sha256_backend,
     sha256_hex,
+    sha256_scalar,
     to_hex,
 )
 from .fileio import (

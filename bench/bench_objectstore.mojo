@@ -7,10 +7,17 @@ loopback plus that server, not a CDN. That is still the useful number: it is
 the ceiling the client is nowhere near.
 """
 
+from std.ffi import OwnedDLHandle, c_size_t
 from std.os import getenv
+from std.os.path import exists as path_exists
 from std.time import monotonic
 
-from objectstore.crypto import sha256
+from objectstore.crypto import (
+    hmac_sha256,
+    sha256,
+    sha256_backend,
+    sha256_scalar,
+)
 from objectstore.fileio import FileIOResolver
 from objectstore.http import HttpClient, Header, curl_version
 from objectstore.httpio import HttpInputFile
@@ -20,6 +27,25 @@ from objectstore.s3 import S3Client, S3Config
 
 
 comptime MB = 1024 * 1024
+
+
+def _libcrypto_path() -> String:
+    """OpenSSL is in this environment as a libcurl dependency. The benchmark
+    uses it as a reference point only — `objectstore` does not link it."""
+    var prefix = getenv("CONDA_PREFIX", "")
+    if prefix == "":
+        return String("")
+    var candidates: List[String] = [
+        String("/lib/libcrypto.3.dylib"),
+        String("/lib/libcrypto.so.3"),
+        String("/lib/libcrypto.dylib"),
+        String("/lib/libcrypto.so"),
+    ]
+    for k in range(len(candidates)):
+        var path = prefix + candidates[k]
+        if path_exists(path):
+            return path^
+    return String("")
 
 
 def _rate(label: String, bytes: Int, elapsed_ns: Int) -> None:
@@ -67,11 +93,61 @@ def main() raises:
     _rate("local read_range x1k", total, t1 - t0)
 
     # ── SHA-256, the cost SigV4 adds to a signed PUT ───────────────────────
+    # Three numbers on the same 64 MiB: the backend this build compiled in,
+    # the portable scalar one it falls back to, and OpenSSL's — which is the
+    # honest ceiling, since libcrypto has had a hand-written assembly SHA-256
+    # for a decade. The point of the hardware path is not to beat OpenSSL, it
+    # is to stop paying a 30-plus-times penalty for not linking it.
+    print("\n== SHA-256 (backend:", sha256_backend(), ")")
+    var h64 = 64 * MB
     t0 = monotonic()
-    var digest = sha256(Span(data))
+    var digest = sha256(Span(data)[0:h64])
     t1 = monotonic()
-    _rate("sha256 (signed PUT) ", n, t1 - t0)
+    _rate("sha256 " + sha256_backend() + "  ", h64, t1 - t0)
+
+    t0 = monotonic()
+    var scalar_digest = sha256_scalar(Span(data)[0:h64])
+    t1 = monotonic()
+    _rate("sha256 scalar       ", h64, t1 - t0)
+    _ = scalar_digest^
+
+    var libcrypto = _libcrypto_path()
+    if libcrypto == "":
+        print("(no libcrypto in CONDA_PREFIX — skipping the OpenSSL reference)")
+    else:
+        var lib = OwnedDLHandle(libcrypto)
+        var ossl = lib.get_function[
+            UnsafePointer[UInt8, MutUntrackedOrigin]
+        ]("SHA256")
+        var out = List[UInt8](length=32, fill=0)
+        t0 = monotonic()
+        _ = ossl(data.unsafe_ptr(), c_size_t(h64), out.unsafe_ptr())
+        t1 = monotonic()
+        _rate("sha256 OpenSSL (ref)", h64, t1 - t0)
+        var same = True
+        for k in range(32):
+            if out[k] != digest[k]:
+                same = False
+        print("   digests agree:", same)
+        _ = out^
     _ = digest^
+
+    # ── HMAC-SHA256: SigV4's signing key derivation and the signature ──────
+    var key = List[UInt8](length=32, fill=0x5A)
+    var msg8k = List[UInt8](length=8 * 1024, fill=0x42)
+    t0 = monotonic()
+    for _ in range(10000):
+        var mac = hmac_sha256(Span(key), Span(msg8k))
+        _ = mac^
+    t1 = monotonic()
+    var hmac_secs = Float64(t1 - t0) / 1.0e9
+    print(
+        "hmac-sha256 8 KB x10k   ", hmac_secs, "s  =",
+        (Float64(10000 * 8 * 1024) / Float64(MB)) / hmac_secs, "MB/s  =",
+        (hmac_secs * 1.0e6) / 10000.0, "us/op",
+    )
+    _ = key^
+    _ = msg8k^
 
     # ── HTTP ───────────────────────────────────────────────────────────────
     var base = getenv("OBJECTSTORE_BENCH_HTTP", "")
