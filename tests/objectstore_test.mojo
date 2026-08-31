@@ -22,6 +22,7 @@ from objectstore.crypto import (
     sha256_backend,
     sha256_hex,
     sha256_scalar,
+    sha256_target_features,
     to_hex,
 )
 from objectstore.azure import (
@@ -193,6 +194,7 @@ def test_sha256_hardware_matches_scalar() raises:
     expensive enough that a thousand of them would dominate the suite.
     """
     print("sha256 backend:", sha256_backend())
+    print("sha256 target features:", sha256_target_features())
     var rng = UInt32(0x9E3779B9)
     var buf = _random_bytes(rng, 10240)
     var bad = 0
@@ -1154,6 +1156,15 @@ def test_s3_config_from_properties() raises:
     var c2 = S3Config.from_properties(props)
     assert_equal(c2.region, "us-west-2")
     assert_true(not c2.path_style)
+    # Payload signing is on unless asked otherwise.
+    assert_true(c2.sign_payload)
+
+    props["s3.multipart.part-size-bytes"] = "16777216"
+    props["s3.unsigned-payload"] = "true"
+    var c3 = S3Config.from_properties(props)
+    assert_equal(c3.multipart_part_size, 16777216)
+    assert_equal(c3.multipart_threshold, 16777216)
+    assert_true(not c3.sign_payload)
 
 
 def test_s3_xml_parsing() raises:
@@ -1452,6 +1463,32 @@ def _s3_bucket() -> String:
 
 def _s3_client() raises -> S3Client:
     return S3Client(S3Config.from_env())
+
+
+def test_s3_unsigned_payload() raises:
+    """`s3.unsigned-payload=true` signs `UNSIGNED-PAYLOAD` in place of the
+    body hash. MinIO verifies signatures, so a successful round trip is proof
+    the canonical request is right — and a multipart body exercises the same
+    path per part."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_unsigned_payload: no S3 server")
+        return
+    var props = Dict[String, String]()
+    props["s3.unsigned-payload"] = "true"
+    var config = S3Config.from_properties(props)
+    assert_true(not config.sign_payload)
+    var c = S3Client(config^)
+    var bucket = _s3_bucket()
+    var key = String("unsigned/payload.bin")
+
+    var data = List[UInt8]()
+    for i in range(4096):
+        data.append(UInt8((i * 7) % 256))
+    c.put_object(bucket, key, Span(data), String("application/octet-stream"))
+    assert_equal(sha256_hex(Span(c.get_object(bucket, key))),
+                 sha256_hex(Span(data)))
+    c.delete_object(bucket, key)
+    assert_true(not c.object_exists(bucket, key))
 
 
 def test_s3_roundtrip() raises:

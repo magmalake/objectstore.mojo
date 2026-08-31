@@ -87,6 +87,30 @@ def sha256_backend() -> String:
     return String(_BACKEND)
 
 
+def sha256_target_features() -> String:
+    """The CPU features this build was compiled against, as the backend choice
+    saw them. A `scalar` backend on hardware that plainly has the extension
+    means `mojo` did not resolve the host CPU — this is the line that says
+    so."""
+    var out = String("x86=")
+    out += "1" if CompilationTarget.is_x86() else "0"
+    out += " apple-silicon="
+    out += "1" if CompilationTarget.is_apple_silicon() else "0"
+    out += " neon="
+    out += "1" if CompilationTarget._has_feature["neon"]() else "0"
+    out += " sha2="
+    out += "1" if CompilationTarget._has_feature["sha2"]() else "0"
+    out += " aes="
+    out += "1" if CompilationTarget._has_feature["aes"]() else "0"
+    out += " sha="
+    out += "1" if CompilationTarget._has_feature["sha"]() else "0"
+    out += " ssse3="
+    out += "1" if CompilationTarget._has_feature["ssse3"]() else "0"
+    out += " sse4.1="
+    out += "1" if CompilationTarget._has_feature["sse4.1"]() else "0"
+    return out^
+
+
 # ---------------------------------------------------------------------------
 # Scalar backend (FIPS 180-4 §6.2, portable)
 # ---------------------------------------------------------------------------

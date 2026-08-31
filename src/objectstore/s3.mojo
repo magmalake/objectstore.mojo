@@ -77,7 +77,9 @@ struct S3Config(Copyable, Movable):
     var sign_payload: Bool
     """When false, `PUT` bodies are signed as `UNSIGNED-PAYLOAD` — a real
     option for a large object over TLS, where hashing the payload twice is
-    pure overhead."""
+    pure overhead. Set from the `s3.unsigned-payload` property; default on,
+    since dropping it also drops the guarantee that what S3 stored is what
+    was signed."""
     var anonymous: Bool
     """Skip signing entirely: public buckets, and presigned URLs, need no
     credentials and are rejected by some servers if signed anyway."""
@@ -152,8 +154,9 @@ struct S3Config(Copyable, Movable):
 
         Recognised: `s3.endpoint`, `s3.access-key-id`, `s3.secret-access-key`,
         `s3.session-token`, `s3.region`, `s3.path-style-access`,
-        `s3.multipart.part-size-bytes` (Iceberg's own name and units), and
-        `client.region` as a fallback for the region.
+        `s3.multipart.part-size-bytes` (Iceberg's own name and units),
+        `client.region` as a fallback for the region, and
+        `s3.unsigned-payload`.
 
         Iceberg's `s3.multipart.threshold` is a *factor* of the part size
         expressed as a decimal, which needs a float parser this module does
@@ -179,6 +182,13 @@ struct S3Config(Copyable, Movable):
         if "s3.multipart.part-size-bytes" in props:
             c.multipart_part_size = Int(props["s3.multipart.part-size-bytes"])
             c.multipart_threshold = c.multipart_part_size
+        if "s3.unsigned-payload" in props:
+            # Not an Iceberg property — this module's own name for what SigV4
+            # permits: signing `UNSIGNED-PAYLOAD` instead of the body hash.
+            # Default off, because it drops the end-to-end integrity check
+            # that the bytes S3 stored are the bytes that were signed; over
+            # plain HTTP it should stay off.
+            c.sign_payload = not _truthy(props["s3.unsigned-payload"])
         c.anonymous = not c.credentials.is_set()
         return c^
 

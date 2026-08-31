@@ -19,6 +19,7 @@ from .crypto import (
     sha256_backend,
     sha256_hex,
     sha256_scalar,
+    sha256_target_features,
     to_hex,
 )
 from .fileio import (
