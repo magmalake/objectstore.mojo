@@ -6,7 +6,7 @@ Storage and HTTP for Apache Iceberg tables in Mojo: a `FileIO` abstraction over
 local files, HTTP(S) range reads and S3, with the HTTP transport the rest of the
 stack was missing.
 
-Part of **magmalake** — data lake building blocks in Mojo
+Part of [**magmalake**](https://magmalake.org) — data lake building blocks in Mojo
 
 ```mojo
 from objectstore import FileIOResolver
