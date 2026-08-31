@@ -31,7 +31,8 @@ every other `-march=native` build.
 If a general-purpose home ever appears, this belongs in hashes.mojo.
 """
 
-from std.sys import llvm_intrinsic
+from std.ffi import external_call
+from std.sys import inlined_assembly, llvm_intrinsic
 from std.sys.info import CompilationTarget
 
 
@@ -61,11 +62,30 @@ comptime SHA256_BLOCK_SIZE = 64
 
 comptime _U4 = SIMD[DType.uint32, 4]
 
-comptime _HAS_ARM_SHA2 = (
-    CompilationTarget._has_feature["neon"]()
-    and CompilationTarget._has_feature["sha2"]()
+comptime _IS_AARCH64 = (
+    CompilationTarget._has_feature["neon"]() and not CompilationTarget.is_x86()
 )
-"""`neon` is aarch64-only and `sha2` is the ARMv8 SHA-2 crypto extension."""
+"""`neon` is baseline on aarch64 and absent everywhere else."""
+
+comptime _ARM_SHA2_ADVERTISED = (
+    _IS_AARCH64 and CompilationTarget._has_feature["sha2"]()
+)
+"""The target's CPU advertises the ARMv8 SHA-2 extension, so the four
+`llvm.aarch64.crypto.*` intrinsics will select."""
+
+comptime _ARM_SHA2_ASM = (
+    _IS_AARCH64
+    and not _ARM_SHA2_ADVERTISED
+    and (CompilationTarget.is_macos() or CompilationTarget.is_linux())
+)
+"""The target is aarch64 but `mojo` resolved no CPU — which is what happens on
+a GitHub `macos-latest` runner, where the host CPU comes back generic and the
+intrinsics would fail to select even though every arm64 Mac has the extension.
+The same four instructions go in through inline assembly instead, under
+`.arch_extension sha2`, which the assembler accepts whatever the target CPU
+is. Whether they may actually run is then a *run-time* question: on macOS the
+answer is always yes (the crypto extension is mandatory on Apple Silicon), and
+on Linux the kernel answers it through `AT_HWCAP`."""
 
 comptime _HAS_X86_SHA_NI = (
     CompilationTarget.is_x86()
@@ -75,16 +95,35 @@ comptime _HAS_X86_SHA_NI = (
 )
 """SHA-NI proper, plus the two shuffle/blend families the schedule needs."""
 
-comptime _BACKEND = "armv8-crypto" if _HAS_ARM_SHA2 else (
-    "x86-sha-ni" if _HAS_X86_SHA_NI else "scalar"
-)
+comptime AT_HWCAP = 16
+comptime HWCAP_SHA2 = 1 << 6
+
+
+@always_inline
+def _arm_sha2_at_runtime() -> Bool:
+    """Only consulted when `_ARM_SHA2_ASM` compiled the instructions in
+    without the target advertising them. Once per `update`, not per block."""
+    comptime if CompilationTarget.is_macos():
+        return True
+    comptime if CompilationTarget.is_linux():
+        return (
+            external_call["getauxval", UInt64](UInt64(AT_HWCAP))
+            & UInt64(HWCAP_SHA2)
+        ) != UInt64(0)
+    return False
 
 
 def sha256_backend() -> String:
-    """Which compression backend this build compiled in: `armv8-crypto`,
-    `x86-sha-ni` or `scalar`. Benchmarks and tests print it so a CI log says
-    which path it actually exercised."""
-    return String(_BACKEND)
+    """Which compression backend this build is using: `armv8-crypto`,
+    `armv8-crypto (asm)`, `x86-sha-ni` or `scalar`. Benchmarks and tests print
+    it so a CI log says which path it actually exercised."""
+    comptime if _ARM_SHA2_ADVERTISED:
+        return String("armv8-crypto")
+    comptime if _ARM_SHA2_ASM:
+        return String("armv8-crypto (asm)") if _arm_sha2_at_runtime() else String("scalar")
+    comptime if _HAS_X86_SHA_NI:
+        return String("x86-sha-ni")
+    return String("scalar")
 
 
 def sha256_target_features() -> String:
@@ -203,26 +242,50 @@ def _blocks_scalar(
 
 
 @always_inline
-def _sha256h(abcd: _U4, efgh: _U4, wk: _U4) -> _U4:
+def _sha256h[asm: Bool](abcd: _U4, efgh: _U4, wk: _U4) -> _U4:
+    comptime if asm:
+        return inlined_assembly[
+            ".arch_extension sha2\nsha256h ${0:q}, ${2:q}, $3.4s",
+            _U4,
+            constraints="=w,0,w,w",
+        ](abcd, efgh, wk)
     return llvm_intrinsic["llvm.aarch64.crypto.sha256h", _U4](abcd, efgh, wk)
 
 
 @always_inline
-def _sha256h2(efgh: _U4, abcd: _U4, wk: _U4) -> _U4:
+def _sha256h2[asm: Bool](efgh: _U4, abcd: _U4, wk: _U4) -> _U4:
+    comptime if asm:
+        return inlined_assembly[
+            ".arch_extension sha2\nsha256h2 ${0:q}, ${2:q}, $3.4s",
+            _U4,
+            constraints="=w,0,w,w",
+        ](efgh, abcd, wk)
     return llvm_intrinsic["llvm.aarch64.crypto.sha256h2", _U4](efgh, abcd, wk)
 
 
 @always_inline
-def _sha256su0(w0: _U4, w4: _U4) -> _U4:
+def _sha256su0[asm: Bool](w0: _U4, w4: _U4) -> _U4:
+    comptime if asm:
+        return inlined_assembly[
+            ".arch_extension sha2\nsha256su0 $0.4s, $2.4s",
+            _U4,
+            constraints="=w,0,w",
+        ](w0, w4)
     return llvm_intrinsic["llvm.aarch64.crypto.sha256su0", _U4](w0, w4)
 
 
 @always_inline
-def _sha256su1(tw0: _U4, w8: _U4, w12: _U4) -> _U4:
+def _sha256su1[asm: Bool](tw0: _U4, w8: _U4, w12: _U4) -> _U4:
+    comptime if asm:
+        return inlined_assembly[
+            ".arch_extension sha2\nsha256su1 $0.4s, $2.4s, $3.4s",
+            _U4,
+            constraints="=w,0,w,w",
+        ](tw0, w8, w12)
     return llvm_intrinsic["llvm.aarch64.crypto.sha256su1", _U4](tw0, w8, w12)
 
 
-def _blocks_arm(
+def _blocks_arm[asm: Bool](
     mut hv: SIMD[DType.uint32, 8], data: Span[UInt8, _], start: Int, nblocks: Int
 ):
     """The standard four-instruction ARMv8 schedule: 16 groups of four rounds,
@@ -256,60 +319,60 @@ def _blocks_arm(
         # consumes `m[j % 4] + K[4j]`, prepares `m[(j+1) % 4] + K[4(j+1)]` for
         # its successor, and rolls `m[j % 4]` forward sixteen words.
         comptime for gr in range(3):
-            m0 = _sha256su0(m0, m1)
+            m0 = _sha256su0[asm](m0, m1)
             save = s0
             wk = m1 + _K.slice[4, offset = 16 * gr + 4]()
-            s0 = _sha256h(s0, s1, cur)
-            s1 = _sha256h2(s1, save, cur)
-            m0 = _sha256su1(m0, m2, m3)
+            s0 = _sha256h[asm](s0, s1, cur)
+            s1 = _sha256h2[asm](s1, save, cur)
+            m0 = _sha256su1[asm](m0, m2, m3)
             cur = wk
 
-            m1 = _sha256su0(m1, m2)
+            m1 = _sha256su0[asm](m1, m2)
             save = s0
             wk = m2 + _K.slice[4, offset = 16 * gr + 8]()
-            s0 = _sha256h(s0, s1, cur)
-            s1 = _sha256h2(s1, save, cur)
-            m1 = _sha256su1(m1, m3, m0)
+            s0 = _sha256h[asm](s0, s1, cur)
+            s1 = _sha256h2[asm](s1, save, cur)
+            m1 = _sha256su1[asm](m1, m3, m0)
             cur = wk
 
-            m2 = _sha256su0(m2, m3)
+            m2 = _sha256su0[asm](m2, m3)
             save = s0
             wk = m3 + _K.slice[4, offset = 16 * gr + 12]()
-            s0 = _sha256h(s0, s1, cur)
-            s1 = _sha256h2(s1, save, cur)
-            m2 = _sha256su1(m2, m0, m1)
+            s0 = _sha256h[asm](s0, s1, cur)
+            s1 = _sha256h2[asm](s1, save, cur)
+            m2 = _sha256su1[asm](m2, m0, m1)
             cur = wk
 
-            m3 = _sha256su0(m3, m0)
+            m3 = _sha256su0[asm](m3, m0)
             save = s0
             wk = m0 + _K.slice[4, offset = 16 * gr + 16]()
-            s0 = _sha256h(s0, s1, cur)
-            s1 = _sha256h2(s1, save, cur)
-            m3 = _sha256su1(m3, m1, m2)
+            s0 = _sha256h[asm](s0, s1, cur)
+            s1 = _sha256h2[asm](s1, save, cur)
+            m3 = _sha256su1[asm](m3, m1, m2)
             cur = wk
 
         # Groups 12-15 (rounds 48-63): the schedule is complete.
         save = s0
         wk = m1 + _K.slice[4, offset=52]()
-        s0 = _sha256h(s0, s1, cur)
-        s1 = _sha256h2(s1, save, cur)
+        s0 = _sha256h[asm](s0, s1, cur)
+        s1 = _sha256h2[asm](s1, save, cur)
         cur = wk
 
         save = s0
         wk = m2 + _K.slice[4, offset=56]()
-        s0 = _sha256h(s0, s1, cur)
-        s1 = _sha256h2(s1, save, cur)
+        s0 = _sha256h[asm](s0, s1, cur)
+        s1 = _sha256h2[asm](s1, save, cur)
         cur = wk
 
         save = s0
         wk = m3 + _K.slice[4, offset=60]()
-        s0 = _sha256h(s0, s1, cur)
-        s1 = _sha256h2(s1, save, cur)
+        s0 = _sha256h[asm](s0, s1, cur)
+        s1 = _sha256h2[asm](s1, save, cur)
         cur = wk
 
         save = s0
-        s0 = _sha256h(s0, s1, cur)
-        s1 = _sha256h2(s1, save, cur)
+        s0 = _sha256h[asm](s0, s1, cur)
+        s1 = _sha256h2[asm](s1, save, cur)
 
         s0 += abef
         s1 += cdgh
@@ -419,11 +482,18 @@ def _blocks_x86(
 def _compress_blocks(
     mut hv: SIMD[DType.uint32, 8], data: Span[UInt8, _], start: Int, nblocks: Int
 ):
-    comptime if _HAS_ARM_SHA2:
-        _blocks_arm(hv, data, start, nblocks)
+    comptime if _ARM_SHA2_ADVERTISED:
+        _blocks_arm[False](hv, data, start, nblocks)
+    comptime if _ARM_SHA2_ASM:
+        if _arm_sha2_at_runtime():
+            _blocks_arm[True](hv, data, start, nblocks)
+        else:
+            _blocks_scalar(hv, data, start, nblocks)
     comptime if _HAS_X86_SHA_NI:
         _blocks_x86(hv, data, start, nblocks)
-    comptime if not (_HAS_ARM_SHA2 or _HAS_X86_SHA_NI):
+    comptime if not (
+        _ARM_SHA2_ADVERTISED or _ARM_SHA2_ASM or _HAS_X86_SHA_NI
+    ):
         _blocks_scalar(hv, data, start, nblocks)
 
 
