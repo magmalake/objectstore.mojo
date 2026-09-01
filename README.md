@@ -26,6 +26,14 @@ $ objectstore-mojo presign s3://warehouse/data/f.parquet 900
 
 ---
 
+## Install
+
+```sh
+pixi shelf add objectstore-mojo
+```
+
+That resolves the tin from [mojoshelf](https://mojoshelf.org) and adds it — along with the tins it depends on — as **pixi git source dependencies**. magmalake tins are not published to a conda channel, so `pixi add objectstore-mojo` will not find them.
+
 ## Why libcurl
 
 Phase 2 of this stack established that **no Mojo HTTP client resolves from
