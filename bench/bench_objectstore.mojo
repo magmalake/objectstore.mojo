@@ -54,14 +54,26 @@ def _rate(label: String, bytes: Int, elapsed_ns: Int) -> None:
     print(label, "  ", bytes // MB, "MB in", secs, "s  =", mbps, "MB/s")
 
 
-def _per_request(label: String, requests: Int, bytes: Int, elapsed_ns: Int) -> None:
+def _per_request(
+    label: String, requests: Int, bytes: Int, elapsed_ns: Int
+) -> None:
     """Range reads are latency-bound, so the number that matters is the cost of
     one request, not the aggregate throughput."""
     var secs = Float64(elapsed_ns) / 1.0e9
     var mbps = (Float64(bytes) / Float64(MB)) / secs
     var ms = (secs * 1000.0) / Float64(requests)
-    print(label, "  ", requests, "requests in", secs, "s  =", ms,
-          "ms/request  (", mbps, "MB/s )")
+    print(
+        label,
+        "  ",
+        requests,
+        "requests in",
+        secs,
+        "s  =",
+        ms,
+        "ms/request  (",
+        mbps,
+        "MB/s )",
+    )
 
 
 def main() raises:
@@ -116,9 +128,9 @@ def main() raises:
         print("(no libcrypto in CONDA_PREFIX — skipping the OpenSSL reference)")
     else:
         var lib = OwnedDLHandle(libcrypto)
-        var ossl = lib.get_function[
-            UnsafePointer[UInt8, MutUntrackedOrigin]
-        ]("SHA256")
+        var ossl = lib.get_function[UnsafePointer[UInt8, MutUntrackedOrigin]](
+            "SHA256"
+        )
         var out = List[UInt8](length=32, fill=0)
         t0 = monotonic()
         _ = ossl(data.unsafe_ptr(), c_size_t(h64), out.unsafe_ptr())
@@ -142,9 +154,13 @@ def main() raises:
     t1 = monotonic()
     var hmac_secs = Float64(t1 - t0) / 1.0e9
     print(
-        "hmac-sha256 8 KB x10k   ", hmac_secs, "s  =",
-        (Float64(10000 * 8 * 1024) / Float64(MB)) / hmac_secs, "MB/s  =",
-        (hmac_secs * 1.0e6) / 10000.0, "us/op",
+        "hmac-sha256 8 KB x10k   ",
+        hmac_secs,
+        "s  =",
+        (Float64(10000 * 8 * 1024) / Float64(MB)) / hmac_secs,
+        "MB/s  =",
+        (hmac_secs * 1.0e6) / 10000.0,
+        "us/op",
     )
     _ = key^
     _ = msg8k^

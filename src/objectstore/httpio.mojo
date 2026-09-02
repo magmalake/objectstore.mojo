@@ -17,7 +17,7 @@ from .ranges import ByteRange, RangeReader, read_ranges_coalesced
 
 
 @fieldwise_init
-struct HttpInputFile(RangeReader, Copyable, Movable):
+struct HttpInputFile(Copyable, Movable, RangeReader):
     var url: String
     var client: HttpClient
     var headers: List[Header]
@@ -68,9 +68,7 @@ struct HttpInputFile(RangeReader, Copyable, Movable):
             )
         var cl = r.header("Content-Length")
         if cl == "":
-            raise Error(
-                "objectstore.httpio: no Content-Length for " + self.url
-            )
+            raise Error("objectstore.httpio: no Content-Length for " + self.url)
         return Int(cl)
 
     def read_all(self) raises -> List[UInt8]:
@@ -112,9 +110,7 @@ struct HttpInputFile(RangeReader, Copyable, Movable):
         out.extend(Span(r.body)[start:end])
         return out^
 
-    def read_ranges(
-        self, ranges: List[ByteRange]
-    ) raises -> List[List[UInt8]]:
+    def read_ranges(self, ranges: List[ByteRange]) raises -> List[List[UInt8]]:
         """One request per *group* of nearby ranges rather than one per range.
 
         Connection reuse made a request cheap; this makes it rare. A Parquet
@@ -150,7 +146,9 @@ struct HttpOutputFile(Copyable, Movable):
         return self.url
 
     def exists(self) raises -> Bool:
-        return HttpInputFile(self.url, self.client.copy(), self.headers.copy()).exists()
+        return HttpInputFile(
+            self.url, self.client.copy(), self.headers.copy()
+        ).exists()
 
     def create(self, data: Span[UInt8, _]) raises:
         if self.exists():
@@ -162,9 +160,7 @@ struct HttpOutputFile(Copyable, Movable):
         r.raise_for_status("objectstore.httpio: PUT " + self.url)
 
 
-def http_delete(
-    url: String, headers: List[Header], client: HttpClient
-) raises:
+def http_delete(url: String, headers: List[Header], client: HttpClient) raises:
     var r = client.delete(url, headers.copy())
     if not r.ok() and r.status != 404:
         r.raise_for_status("objectstore.httpio: DELETE " + url)

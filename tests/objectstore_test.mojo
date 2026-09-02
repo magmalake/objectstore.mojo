@@ -90,7 +90,13 @@ from objectstore.s3 import (
     xml_text,
     xml_unescape,
 )
-from objectstore.sigv4 import AmzTime, canonical_path, canonical_query, QueryParam, sign_request
+from objectstore.sigv4 import (
+    AmzTime,
+    canonical_path,
+    canonical_query,
+    QueryParam,
+    sign_request,
+)
 
 
 def _bytes(s: String) -> List[UInt8]:
@@ -124,9 +130,7 @@ def test_sha256_vectors() raises:
     )
     assert_equal(
         sha256_hex(
-            String(
-                "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-            )
+            String("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
         ),
         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
     )
@@ -157,7 +161,8 @@ def test_sha256_one_million_a() raises:
 
 @always_inline
 def _xorshift32(mut state: UInt32) -> UInt32:
-    """A deterministic PRNG, so a failure is reproducible from the seed alone."""
+    """A deterministic PRNG, so a failure is reproducible from the seed alone.
+    """
     var x = state
     x ^= x << UInt32(13)
     x ^= x >> UInt32(17)
@@ -264,9 +269,7 @@ def test_sha256_matches_openssl() raises:
         print("SKIP test_sha256_matches_openssl: no libcrypto in CONDA_PREFIX")
         return
     var lib = OwnedDLHandle(path)
-    var f = lib.get_function[
-        UnsafePointer[UInt8, MutUntrackedOrigin]
-    ]("SHA256")
+    var f = lib.get_function[UnsafePointer[UInt8, MutUntrackedOrigin]]("SHA256")
     var rng = UInt32(0xC0FFEE11)
     var buf = _random_bytes(rng, 10240)
     var out = List[UInt8](length=32, fill=0)
@@ -309,9 +312,7 @@ def test_hmac_sha256_rfc4231() raises:
     )
     assert_equal(
         to_hex(
-            Span(
-                hmac_sha256(Span(_repeat(0xAA, 20)), Span(_repeat(0xDD, 50)))
-            )
+            Span(hmac_sha256(Span(_repeat(0xAA, 20)), Span(_repeat(0xDD, 50))))
         ),
         "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
     )
@@ -330,8 +331,7 @@ def test_hmac_sha256_rfc4231() raises:
                 hmac_sha256(
                     Span(_repeat(0xAA, 131)),
                     String(
-                        "Test Using Larger Than Block-Size Key - Hash Key"
-                        " First"
+                        "Test Using Larger Than Block-Size Key - Hash Key First"
                     ),
                 )
             )
@@ -544,7 +544,7 @@ def test_http_headers_encoding() raises:
     var parsed = parse_headers(
         String(
             "HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\nHTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\nETag: \"abc\"\r\n\r\n"
+            'Content-Type: text/plain\r\nETag: "abc"\r\n\r\n'
         )
     )
     # Only the final response block survives: a redirect chain would otherwise
@@ -653,16 +653,12 @@ def test_http_input_file() raises:
 
     var mid = f.read_range(500, 10)
     assert_equal(len(mid), 10)
-    assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(mid))), "0123456789"
-    )
+    assert_equal(String(StringSlice(unsafe_from_utf8=Span(mid))), "0123456789")
 
     # Suffix range: the last 5 bytes of 100 000 digits.
     var tail = f.read_range(-5, 5)
     assert_equal(len(tail), 5)
-    assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(tail))), "56789"
-    )
+    assert_equal(String(StringSlice(unsafe_from_utf8=Span(tail))), "56789")
 
     assert_true(not HttpInputFile(base + "/files/nope.txt").exists())
 
@@ -1016,7 +1012,8 @@ def test_retry_only_when_repeatable() raises:
 
 
 def test_retry_s3_error_codes() raises:
-    """`SlowDown` and `RequestTimeout` arrive as a 400 and are still transient."""
+    """`SlowDown` and `RequestTimeout` arrive as a 400 and are still transient.
+    """
     var base = _http_base()
     if base == "":
         print("SKIP test_retry_s3_error_codes: no server")
@@ -1169,7 +1166,7 @@ def test_s3_config_from_properties() raises:
 
 def test_s3_xml_parsing() raises:
     var body = String(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        '<?xml version="1.0" encoding="UTF-8"?>'
         "<ListBucketResult><Name>b</Name><IsTruncated>true</IsTruncated>"
         "<NextContinuationToken>tok/1+2</NextContinuationToken>"
         "<Contents><Key>a/b&amp;c.parquet</Key><Size>1234</Size>"
@@ -1217,7 +1214,10 @@ def test_resolver_scheme_dispatch() raises:
         io.backend_for(String("abfss://c@a.dfs.core.windows.net/k")),
         BACKEND_AZURE,
     )
-    assert_equal(io.backend_for(String("wasbs://c@a.blob.core.windows.net/k")), BACKEND_AZURE)
+    assert_equal(
+        io.backend_for(String("wasbs://c@a.blob.core.windows.net/k")),
+        BACKEND_AZURE,
+    )
     with assert_raises():
         _ = io.backend_for(String("hdfs://nn/k"))
     with assert_raises():
@@ -1369,9 +1369,7 @@ def test_azure_uri_parsing() raises:
     assert_equal(a.container, "warehouse")
     assert_equal(a.path, "db/t/m.json")
 
-    var w = parse_azure_uri(
-        String("wasbs://c@acct.blob.core.windows.net/x/y")
-    )
+    var w = parse_azure_uri(String("wasbs://c@acct.blob.core.windows.net/x/y"))
     assert_equal(w.account, "acct")
     assert_equal(w.container, "c")
     assert_equal(w.path, "x/y")
@@ -1390,8 +1388,10 @@ def test_azure_sas_urls_and_headers() raises:
     var c = AzureConfig.from_properties(props, String("acct"))
     assert_equal(
         c.url_for(String("cont"), String("a/b c.parquet")),
-        "https://acct.blob.core.windows.net/cont/a/b%20c.parquet"
-        "?sv=2021-12-02&sig=SIGNATURE",
+        (
+            "https://acct.blob.core.windows.net/cont/a/b%20c.parquet"
+            "?sv=2021-12-02&sig=SIGNATURE"
+        ),
     )
     # The SAS query already begins the query string, so a list request has to
     # append with `&`, not `?`.
@@ -1414,15 +1414,15 @@ def test_azure_sas_urls_and_headers() raises:
     # An account-specific token beats the generic one.
     props["adls.sas-token"] = "sig=GENERIC"
     assert_true(
-        AzureConfig.from_properties(props, String("acct")).url_for(
-            String("c"), String("k")
-        ).find("SIGNATURE")
+        AzureConfig.from_properties(props, String("acct"))
+        .url_for(String("c"), String("k"))
+        .find("SIGNATURE")
         > 0
     )
     assert_true(
-        AzureConfig.from_properties(props, String("other")).url_for(
-            String("c"), String("k")
-        ).find("GENERIC")
+        AzureConfig.from_properties(props, String("other"))
+        .url_for(String("c"), String("k"))
+        .find("GENERIC")
         > 0
     )
 
@@ -1485,8 +1485,9 @@ def test_s3_unsigned_payload() raises:
     for i in range(4096):
         data.append(UInt8((i * 7) % 256))
     c.put_object(bucket, key, Span(data), String("application/octet-stream"))
-    assert_equal(sha256_hex(Span(c.get_object(bucket, key))),
-                 sha256_hex(Span(data)))
+    assert_equal(
+        sha256_hex(Span(c.get_object(bucket, key))), sha256_hex(Span(data))
+    )
     c.delete_object(bucket, key)
     assert_true(not c.object_exists(bucket, key))
 
@@ -1539,9 +1540,7 @@ def test_s3_keys_needing_encoding() raises:
     var body = _bytes(String("encoded-key"))
     c.put_object(bucket, key, Span(body))
     assert_equal(
-        String(
-            StringSlice(unsafe_from_utf8=Span(c.get_object(bucket, key)))
-        ),
+        String(StringSlice(unsafe_from_utf8=Span(c.get_object(bucket, key)))),
         "encoded-key",
     )
     c.delete_object(bucket, key)
@@ -1564,9 +1563,7 @@ def test_s3_listing() raises:
     assert_equal(len(flat.objects), 8)
 
     # A delimiter turns the flat key space into one level of "directories".
-    var grouped = c.list_objects_v2(
-        bucket, String("listing/"), String("/")
-    )
+    var grouped = c.list_objects_v2(bucket, String("listing/"), String("/"))
     assert_equal(len(grouped.objects), 7)
     assert_equal(len(grouped.common_prefixes), 1)
     assert_equal(grouped.common_prefixes[0], "listing/sub/")
@@ -1780,9 +1777,7 @@ def test_s3_virtual_host_addressing() raises:
     var body = _bytes(String("virtual host addressing"))
     c.put_object(bucket, key, Span(body))
     assert_equal(
-        String(
-            StringSlice(unsafe_from_utf8=Span(c.get_object(bucket, key)))
-        ),
+        String(StringSlice(unsafe_from_utf8=Span(c.get_object(bucket, key)))),
         "virtual host addressing",
     )
     c.delete_object(bucket, key)
@@ -1805,9 +1800,7 @@ def test_s3_presigned_url() raises:
     # The whole point: a client with no credentials at all can read it.
     var anon = HttpInputFile(url)
     assert_equal(
-        String(
-            StringSlice(unsafe_from_utf8=Span(anon.read_all()))
-        ),
+        String(StringSlice(unsafe_from_utf8=Span(anon.read_all()))),
         "presigned payload",
     )
     var ranged = anon.read_range(0, 9)
@@ -1833,9 +1826,7 @@ def test_s3_via_resolver() raises:
     assert_true(io.exists(loc))
     assert_equal(io.read_text(loc), "resolver over s3")
     assert_equal(
-        String(
-            StringSlice(unsafe_from_utf8=Span(io.read_range(loc, 9, 4)))
-        ),
+        String(StringSlice(unsafe_from_utf8=Span(io.read_range(loc, 9, 4)))),
         "over",
     )
     var listed = io.list(String("s3://") + _s3_bucket() + "/resolver/")
@@ -1850,9 +1841,7 @@ def test_s3_bad_credentials() raises:
         print("SKIP test_s3_bad_credentials: no S3 server")
         return
     if getenv("OBJECTSTORE_TEST_S3_KIND", "") != "minio":
-        print(
-            "SKIP test_s3_bad_credentials: only MinIO verifies signatures"
-        )
+        print("SKIP test_s3_bad_credentials: only MinIO verifies signatures")
         return
     var config = S3Config.from_env()
     config.credentials = S3Credentials("wrong", "alsowrong", "")

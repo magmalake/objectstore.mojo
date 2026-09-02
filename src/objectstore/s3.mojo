@@ -426,7 +426,9 @@ struct S3Client(Copyable, Movable):
             rest = _substr(rest, 0, slash)
         return Tuple(scheme^, rest^)
 
-    def url_for(self, bucket: String, key: String) raises -> Tuple[String, String, String]:
+    def url_for(
+        self, bucket: String, key: String
+    ) raises -> Tuple[String, String, String]:
         """Returns `(url, host header value, signing path)`.
 
         The signing path is the request target *before* the query string, and
@@ -561,16 +563,13 @@ struct S3Client(Copyable, Movable):
         var r = self.head_object(bucket, key)
         if not r.ok():
             raise Error(
-                "s3: HEAD "
-                + bucket
-                + "/"
-                + key
-                + ": HTTP "
-                + String(r.status)
+                "s3: HEAD " + bucket + "/" + key + ": HTTP " + String(r.status)
             )
         var cl = r.header("Content-Length")
         if cl == "":
-            raise Error("s3: HEAD " + bucket + "/" + key + ": no Content-Length")
+            raise Error(
+                "s3: HEAD " + bucket + "/" + key + ": no Content-Length"
+            )
         return Int(cl)
 
     def object_exists(self, bucket: String, key: String) raises -> Bool:
@@ -850,9 +849,7 @@ struct S3Client(Copyable, Movable):
         if max_keys > 0:
             params.append(QueryParam("max-keys", String(max_keys)))
         if continuation_token != "":
-            params.append(
-                QueryParam("continuation-token", continuation_token)
-            )
+            params.append(QueryParam("continuation-token", continuation_token))
         var r = self.request("GET", bucket, "", params)
         if not r.ok():
             raise Error(
@@ -874,9 +871,7 @@ struct S3Client(Copyable, Movable):
         var token = String("")
         var pages = 0
         while True:
-            var page = self.list_objects_v2(
-                bucket, prefix, delimiter, 0, token
-            )
+            var page = self.list_objects_v2(bucket, prefix, delimiter, 0, token)
             for k in range(len(page.objects)):
                 out.objects.append(page.objects[k].copy())
             for k in range(len(page.common_prefixes)):

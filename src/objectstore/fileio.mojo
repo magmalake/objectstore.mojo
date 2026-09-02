@@ -68,9 +68,7 @@ trait InputFile(Copyable, Movable):
     def read_range(self, offset: Int, length: Int) raises -> List[UInt8]:
         ...
 
-    def read_ranges(
-        self, ranges: List[ByteRange]
-    ) raises -> List[List[UInt8]]:
+    def read_ranges(self, ranges: List[ByteRange]) raises -> List[List[UInt8]]:
         """Several ranges at once, in the order asked for.
 
         The default is one `read_range` per range, which is exactly right for
@@ -141,7 +139,7 @@ a URL plus headers — a bearer token for GCS, a SAS query string and
 open files themselves are `HttpInputFile`/`HttpOutputFile`."""
 
 
-struct AnyInputFile(InputFile, RangeReader, Copyable, Movable):
+struct AnyInputFile(Copyable, InputFile, Movable, RangeReader):
     """An `InputFile` whose backend is chosen at runtime by URI scheme."""
 
     var backend: Int
@@ -205,9 +203,7 @@ struct AnyInputFile(InputFile, RangeReader, Copyable, Movable):
             self._bucket, self._key, offset, offset + length - 1
         )
 
-    def read_ranges(
-        self, ranges: List[ByteRange]
-    ) raises -> List[List[UInt8]]:
+    def read_ranges(self, ranges: List[ByteRange]) raises -> List[List[UInt8]]:
         """Coalesced for HTTP and S3, one seek per range for local files."""
         if self.backend == BACKEND_LOCAL:
             var out = List[List[UInt8]]()
@@ -219,7 +215,7 @@ struct AnyInputFile(InputFile, RangeReader, Copyable, Movable):
         return read_ranges_coalesced(self, ranges)
 
 
-struct AnyOutputFile(OutputFile, Copyable, Movable):
+struct AnyOutputFile(Copyable, Movable, OutputFile):
     """An `OutputFile` whose backend is chosen at runtime by URI scheme.
 
     The HTTP backend covers three cases that all reduce to a single `PUT`: a
@@ -544,7 +540,9 @@ struct FileIOResolver(Copyable, Movable):
             var res = client.list_all(parts[0], parts[1])
             var out = List[String]()
             for k in range(len(res.objects)):
-                out.append(String("s3://") + parts[0] + "/" + res.objects[k].key)
+                out.append(
+                    String("s3://") + parts[0] + "/" + res.objects[k].key
+                )
             return out^
         if backend == BACKEND_GCS:
             var parts = split_gcs_uri(target)
@@ -553,7 +551,9 @@ struct FileIOResolver(Copyable, Movable):
             ).list_all(parts[0], parts[1])
             var out = List[String]()
             for k in range(len(res.objects)):
-                out.append(String("gs://") + parts[0] + "/" + res.objects[k].key)
+                out.append(
+                    String("gs://") + parts[0] + "/" + res.objects[k].key
+                )
             return out^
         if backend == BACKEND_AZURE:
             var az = parse_azure_uri(target)
@@ -561,7 +561,12 @@ struct FileIOResolver(Copyable, Movable):
                 self.azure_config_for(target, az.account), self.http.copy()
             ).list_blobs(az.container, az.path)
             var out = List[String]()
-            var head = parse_uri(target).scheme + "://" + parse_uri(target).bucket + "/"
+            var head = (
+                parse_uri(target).scheme
+                + "://"
+                + parse_uri(target).bucket
+                + "/"
+            )
             for k in range(len(blobs)):
                 out.append(head + blobs[k].name)
             return out^
@@ -601,7 +606,5 @@ struct FileIOResolver(Copyable, Movable):
         except:
             return False
 
-    def write(
-        self, location: String, data: Span[UInt8, _]
-    ) raises:
+    def write(self, location: String, data: Span[UInt8, _]) raises:
         self.new_output(location).overwrite(data)

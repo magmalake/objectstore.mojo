@@ -82,7 +82,11 @@ struct Uri(Copyable, Movable, Writable):
         `file:///a/b` and `/a/b` both give `/a/b`; a relative bare path is
         returned unchanged so `tests/fixtures/x` keeps working.
         """
-        if self.bucket == "" and self.key != "" and not self.raw.startswith("/"):
+        if (
+            self.bucket == ""
+            and self.key != ""
+            and not self.raw.startswith("/")
+        ):
             if not self.raw.startswith(SCHEME_FILE + "://"):
                 return self.key
         return String("/") + self.key
@@ -247,6 +251,6 @@ def url_encode(s: String, encode_slash: Bool = True) -> String:
             out += String(StringSlice(unsafe_from_utf8=Span(b)[k : k + 1]))
         else:
             out += "%"
-            out += String(_HEXUP[byte = Int(c >> 4)])
-            out += String(_HEXUP[byte = Int(c & 0xF)])
+            out += String(_HEXUP[byte=Int(c >> 4)])
+            out += String(_HEXUP[byte=Int(c & 0xF)])
     return out^

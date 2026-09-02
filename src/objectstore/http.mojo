@@ -186,7 +186,9 @@ def _trim(s: String) -> String:
     var j = len(b)
     while i < j and (b[i] == 32 or b[i] == 9 or b[i] == 13 or b[i] == 10):
         i += 1
-    while j > i and (b[j - 1] == 32 or b[j - 1] == 9 or b[j - 1] == 13 or b[j - 1] == 10):
+    while j > i and (
+        b[j - 1] == 32 or b[j - 1] == 9 or b[j - 1] == 13 or b[j - 1] == 10
+    ):
         j -= 1
     if i >= j:
         return String("")

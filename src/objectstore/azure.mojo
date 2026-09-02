@@ -62,9 +62,7 @@ def parse_azure_uri(location: String) raises -> AzureLocation:
     if at >= 0:
         var b = authority.as_bytes()
         container = String(StringSlice(unsafe_from_utf8=Span(b)[0:at]))
-        host = String(
-            StringSlice(unsafe_from_utf8=Span(b)[at + 1 : len(b)])
-        )
+        host = String(StringSlice(unsafe_from_utf8=Span(b)[at + 1 : len(b)]))
     var account = String("")
     if host != "":
         var dot = host.find(".")
@@ -90,7 +88,10 @@ struct AzureConfig(Copyable, Movable):
         self.endpoint = ""
 
     def __init__(
-        out self, var account: String, var sas_token: String, var endpoint: String
+        out self,
+        var account: String,
+        var sas_token: String,
+        var endpoint: String,
     ):
         self.account = account^
         self.sas_token = sas_token^

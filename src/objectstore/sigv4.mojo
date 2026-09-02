@@ -96,9 +96,7 @@ struct AmzTime(Copyable, Movable):
         var hh = secs // 3600
         var mm = (secs % 3600) // 60
         var ss = secs % 60
-        var amz = (
-            date_stamp + "T" + _pad2(hh) + _pad2(mm) + _pad2(ss) + "Z"
-        )
+        var amz = date_stamp + "T" + _pad2(hh) + _pad2(mm) + _pad2(ss) + "Z"
         return Self(amz^, date_stamp^)
 
     @staticmethod
@@ -405,13 +403,9 @@ def presign_query(
     for k in range(len(params)):
         all_params.append(params[k].copy())
     all_params.append(QueryParam("X-Amz-Algorithm", ALGORITHM))
-    all_params.append(
-        QueryParam("X-Amz-Credential", access_key + "/" + scope)
-    )
+    all_params.append(QueryParam("X-Amz-Credential", access_key + "/" + scope))
     all_params.append(QueryParam("X-Amz-Date", when.amz_date))
-    all_params.append(
-        QueryParam("X-Amz-Expires", String(expires_seconds))
-    )
+    all_params.append(QueryParam("X-Amz-Expires", String(expires_seconds)))
     all_params.append(QueryParam("X-Amz-SignedHeaders", ch[1]))
     if session_token != "":
         all_params.append(QueryParam("X-Amz-Security-Token", session_token))
