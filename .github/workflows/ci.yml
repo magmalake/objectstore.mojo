@@ -45,6 +45,9 @@ jobs:
       - name: Unit tests and CLI build
         run: pixi run -e ${{ matrix.env }} check
 
+      - name: Lint (mojolint --lsp)
+        run: pixi run -e ${{ matrix.env }} lint
+
       # Through `pixi run`, because the binary dlopens the shim from
       # $CONDA_PREFIX/lib and that variable only exists inside the environment.
       - name: CLI smoke

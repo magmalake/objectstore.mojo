@@ -15,11 +15,24 @@ objectstore-shim = { path = "shim" }
 # The HTTP tests run against a throwaway `python -m http.server`; the S3
 # tests run against MinIO or moto. Both are driven by tests/run_tests.sh.
 python = ">=3.10,<3.14"
+# Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi
+# source dependency pinned at the revision mojoshelf published, and builds
+# the `mojolint` executable into every environment next to mojo-lsp-server.
+lint-mojo = { git = "https://github.com/magmalake/lint.mojo.git", rev = "2a12807b7847984aff2c8bf148b0eb7515a99844" }
 
 [tasks]
 # Builds the test binary, spawns the local HTTP server (and MinIO/moto when
 # available), runs everything, tears the servers down. See tests/run_tests.sh.
 test = { cmd = "bash tests/run_tests.sh" }
+# mojolint (lint-mojo, below): the origin and threading mistakes the compiler
+# lets through, with mojo-lsp-server behind the rules. Exit 1 on findings.
+#
+# Not folded into `check` (below): CI's single "Unit tests and CLI build"
+# step already runs `check` as one unit, so adding lint there would make the
+# dedicated CI lint step re-run it on every matrix leg. `check` here already
+# omits other CI-relevant tasks (format-check, the CLI smoke test) for the
+# same reason — it is a local-dev bundle, not a mirror of everything CI runs.
+lint = { cmd = "mojolint --lsp -I src -I tests src tests bench" }
 # Tests plus a CLI build, so a broken CLI fails CI too.
 check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/objectstore-mojo" }
