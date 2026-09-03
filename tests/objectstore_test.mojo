@@ -290,6 +290,12 @@ def test_sha256_matches_openssl() raises:
         checked += 1
     assert_equal(checked, 1000)
     assert_equal(bad, 0)
+    # Keep `lib` alive past `f`'s last call in the loop above: Mojo destroys a
+    # value at its last syntactic use, and `f` was obtained from
+    # `lib.get_function`, so without this `lib.__del__` (dlclose) would run
+    # before the loop even started — see the FFI-handle-lifetime note in
+    # src/objectstore/http.mojo.
+    _ = lib^
     _ = buf^
     _ = out^
 
