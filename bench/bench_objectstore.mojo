@@ -141,6 +141,11 @@ def main() raises:
             if out[k] != digest[k]:
                 same = False
         print("   digests agree:", same)
+        # Keep `lib` alive past `ossl`'s last call: Mojo destroys a value at its
+        # last syntactic use, and `ossl` was obtained from `lib.get_function`, so
+        # without this `lib.__del__` (dlclose) would run before `ossl(...)` above
+        # — see the FFI-handle-lifetime note in src/objectstore/http.mojo.
+        _ = lib^
         _ = out^
     _ = digest^
 
