@@ -269,7 +269,7 @@ def test_sha256_matches_openssl() raises:
         print("SKIP test_sha256_matches_openssl: no libcrypto in CONDA_PREFIX")
         return
     var lib = OwnedDLHandle(path)
-    var f = lib.get_function[UnsafePointer[UInt8, MutUntrackedOrigin]]("SHA256")
+    var f = lib.get_function[Pointer[UInt8, MutUntrackedOrigin]]("SHA256")
     var rng = UInt32(0xC0FFEE11)
     var buf = _random_bytes(rng, 10240)
     var out = List[UInt8](length=32, fill=0)

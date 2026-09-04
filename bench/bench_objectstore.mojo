@@ -128,7 +128,7 @@ def main() raises:
         print("(no libcrypto in CONDA_PREFIX — skipping the OpenSSL reference)")
     else:
         var lib = OwnedDLHandle(libcrypto)
-        var ossl = lib.get_function[UnsafePointer[UInt8, MutUntrackedOrigin]](
+        var ossl = lib.get_function[Pointer[UInt8, MutUntrackedOrigin]](
             "SHA256"
         )
         var out = List[UInt8](length=32, fill=0)

@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "objectstore.mojo"
-version = "0.3.0"
+version = "0.3.1"
 description = "Storage and HTTP layer for magmalake: FileIO over local files, HTTP(S) range reads and S3 (SigV4, vended credentials, presigned URLs)."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -36,7 +36,7 @@ format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- s
 # `from objectstore import …`.
 [package]
 name = "objectstore-mojo"
-version = "0.3.0"
+version = "0.3.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
