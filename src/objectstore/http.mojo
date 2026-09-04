@@ -76,7 +76,7 @@ def _cstr(s: String) -> List[UInt8]:
 def _read_cstring(addr: Int) -> String:
     if addr == 0:
         return String("")
-    var p = UnsafePointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
+    var p = Pointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
     return String(unsafe_from_utf8_ptr=p)
 
 
@@ -649,7 +649,7 @@ struct HttpClient(Copyable, Movable):
 
 
 def curl_version() raises -> String:
-    """libcurl's own version banner, e.g. `libcurl/8.9.1 OpenSSL/3.3.1 …`."""
+    """Libcurl's own version banner, e.g. `libcurl/8.9.1 OpenSSL/3.3.1 …`."""
     var lib = OwnedDLHandle(_find_lib())
     return _do_curl_version(lib)
 
