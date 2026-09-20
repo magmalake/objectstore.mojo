@@ -25,7 +25,7 @@ check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/objectstore-mojo" }
 bench = { cmd = "bash bench/run_bench.sh" }
 fmt = { cmd = "mojo format src tests bench" }
-# `mojo format` has no check mode in 1.0.0 — it rejects `--check`, and there is
+# `mojo format` has no check mode in 1.1.0 — it rejects `--check`, and there is
 # none among the hidden options either — so the check is: format, then assert the
 # tree did not move. It rewrites the files as a side effect, which is what CI
 # wants and is harmless locally; run it with your own work committed or stashed.
@@ -46,21 +46,21 @@ path = "src/objectstore"
 name = "objectstore"
 
 [package.host-dependencies]
-mojo-compiler = "==1.0.0"
+mojo-compiler = "==1.1.0"
 
 [package.build-dependencies]
-mojo-compiler = "==1.0.0"
+mojo-compiler = "==1.1.0"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.0.0,<2"
+mojo-compiler = ">=1.1.0,<2"
 objectstore-shim = { path = "shim" }
 
 # ── stable / nightly toolchain matrix (see CI) ──────────────────────────────
 [feature.nightly.dependencies]
-modular = ">=26.6.0.dev2026082605,<27"
+modular = ">=26.7.0.dev2026092005,<28"
 
 [feature.stable.dependencies]
-mojo-compiler = "==1.0.0"
+mojo-compiler = "==1.1.0"
 
 [environments]
 default = ["nightly"]
