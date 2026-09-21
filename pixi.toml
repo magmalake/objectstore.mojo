@@ -13,8 +13,27 @@ platforms = ["osx-arm64", "linux-64"]
 libcurl = ">=8,<9"
 objectstore-shim = { path = "shim" }
 # The HTTP tests run against a throwaway `python -m http.server`; the S3
-# tests run against MinIO or moto. Both are driven by tests/run_tests.sh.
+# tests run against MinIO. Both are driven by tests/run_tests.sh.
 python = ">=3.10,<3.14"
+# MinIO, as a package rather than a download. CI used to curl the binary from
+# dl.min.io, which now answers 410 for every platform and every release: the
+# open-source server is archived, and the files are gone for good, not down.
+# Because the fetch step was `continue-on-error`, nothing failed — the S3
+# tests just started skipping, silently, on both runners.
+#
+# conda-forge carries `RELEASE.2025-10-15T17-29-55Z`, the last community
+# release and the one these tests were written against, for linux-64 and
+# osx-arm64. It lands as `minio` on PATH, which is already the third thing
+# run_tests.sh looks for, so no script changes.
+#
+# It will not receive updates. That is acceptable for a fixture that binds
+# 127.0.0.1 with well-known test credentials and holds nothing; what is not
+# acceptable is having no SigV4 verifier at all, which is where CI had
+# drifted. moto stays the fallback in the script but proves much less: it
+# does not check signatures, so it exercises request *shapes* and not the
+# signing this tin exists to get right.
+minio-server = ">=2025.10.15"
+
 
 [tasks]
 # Builds the test binary, spawns the local HTTP server (and MinIO/moto when
