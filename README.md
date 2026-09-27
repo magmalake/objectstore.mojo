@@ -493,7 +493,7 @@ never ours — it is there to say how much is left on the table.
 
 ## Tests
 
-`pixi run test` builds the suite, brings up the servers it needs, runs 62 tests,
+`pixi run test` builds the suite, brings up the servers it needs, runs the tests,
 and tears them down:
 
 * SHA-256 and HMAC against FIPS 180-4 and RFC 4231, including the one-million-`a`
@@ -547,7 +547,7 @@ anywhere are MinIO's well-known defaults, reaching a server on `127.0.0.1`.
 
 Sibling magmalake tins are consumed **by source path**, not as packages: the
 `pixi-build-mojo` backend emits a precompiled artifact built with mojo-compiler
-1.0.0 and the nightly compiler rejects it outright, so a package dependency
+1.1.0 and the nightly compiler rejects it outright, so a package dependency
 cannot satisfy both environments.
 
 ```
