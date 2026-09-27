@@ -11,6 +11,10 @@
 #     testing against it; moto does not, so it only proves the request shapes.
 #     Found in this order: $MINIO_BINARY, build/minio, `minio` on PATH,
 #     then `moto_server`. If none is there the S3 tests skip with a message.
+#     The third one is the normal case now: `minio-server` is a workspace
+#     dependency, so the binary is in the environment. It used to be curled
+#     from dl.min.io in CI, which now answers 410 for everything — the
+#     open-source server is archived and the files are gone.
 #
 # Nothing here is secret: MinIO's well-known test credentials are the only
 # ones used, and they only ever reach a server on 127.0.0.1.
