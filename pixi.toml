@@ -65,21 +65,21 @@ path = "src/objectstore"
 name = "objectstore"
 
 [package.host-dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 
 [package.build-dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.1.0,<2"
+mojo-compiler = ">=1.2.0,<2"
 objectstore-shim = { path = "shim" }
 
 # ── stable / nightly toolchain matrix (see CI) ──────────────────────────────
 [feature.nightly.dependencies]
-modular = ">=26.7.0.dev2026101905,<28"
+modular = ">=26.8.0.dev2026102305,<28"
 
 [feature.stable.dependencies]
-mojo-compiler = "==1.1.0"
+mojo-compiler = "==1.2.0"
 
 [environments]
 default = ["nightly"]
