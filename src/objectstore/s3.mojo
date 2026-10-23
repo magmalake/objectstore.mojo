@@ -257,20 +257,19 @@ def xml_unescape(s: String) -> String:
             var semi = s.find(";", i)
             if semi > i and semi - i <= 8:
                 var name = _substr(s, i + 1, semi)
-                if name == "amp":
-                    out += "&"
-                elif name == "lt":
-                    out += "<"
-                elif name == "gt":
-                    out += ">"
-                elif name == "quot":
-                    out += '"'
-                elif name == "apos":
-                    out += "'"
-                elif name == "#39":
-                    out += "'"
-                else:
-                    out += _substr(s, i, semi + 1)
+                match name:
+                    case "amp":
+                        out += "&"
+                    case "lt":
+                        out += "<"
+                    case "gt":
+                        out += ">"
+                    case "quot":
+                        out += '"'
+                    case "apos" | "#39":
+                        out += "'"
+                    case _:
+                        out += _substr(s, i, semi + 1)
                 i = semi + 1
                 continue
         out += String(StringSlice(unsafe_from_utf8=Span(b)[i : i + 1]))
@@ -288,14 +287,15 @@ def xml_escape(s: String) -> String:
     var out = String("")
     var b = s.as_bytes()
     for k in range(len(b)):
-        if b[k] == 38:  # &
-            out += "&amp;"
-        elif b[k] == 60:  # <
-            out += "&lt;"
-        elif b[k] == 62:  # >
-            out += "&gt;"
-        else:
-            out += String(StringSlice(unsafe_from_utf8=Span(b)[k : k + 1]))
+        match b[k]:
+            case 38:  # &
+                out += "&amp;"
+            case 60:  # <
+                out += "&lt;"
+            case 62:  # >
+                out += "&gt;"
+            case _:
+                out += String(StringSlice(unsafe_from_utf8=Span(b)[k : k + 1]))
     return out^
 
 
