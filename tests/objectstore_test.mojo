@@ -7,7 +7,7 @@ addressing) runs unconditionally and needs no network at all.
 """
 
 from std.collections import Dict
-from std.os import getenv, remove
+from std.os import getenv, remove, setenv, unsetenv
 from std.os.path import exists as path_exists
 from std.ffi import OwnedDLHandle, c_size_t
 from std.testing import TestSuite, assert_equal, assert_raises, assert_true
@@ -84,6 +84,7 @@ from objectstore.s3 import (
     S3Client,
     S3Config,
     S3Credentials,
+    instance_credentials,
     parse_list_objects,
     split_s3_uri,
     xml_blocks,
@@ -1855,6 +1856,71 @@ def test_s3_bad_credentials() raises:
     var c = S3Client(config^)
     with assert_raises():
         _ = c.get_object(_s3_bucket(), String("anything"))
+
+
+# ---------------------------------------------------------------------------
+# EC2 instance-role credentials, against tests/imds_server.py
+# ---------------------------------------------------------------------------
+
+comptime _ROLE_ENV: List[StaticString] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_EC2_METADATA_DISABLED",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+]
+
+
+def _set_env(name: StaticString, value: String):
+    if value == "":
+        _ = unsetenv(name)
+    else:
+        _ = setenv(name, value)
+
+
+def test_from_env_falls_back_to_the_instance_role() raises:
+    """No keys and no endpoint: the IMDSv2 role's credentials; keys in the
+    environment, a custom endpoint or AWS_EC2_METADATA_DISABLED win."""
+    var imds = getenv("OBJECTSTORE_TEST_IMDS", "")
+    if imds == "":
+        print("SKIP test_from_env_falls_back_to_the_instance_role: no mock")
+        return
+    var saved = List[String]()
+    for name in materialize[_ROLE_ENV]():
+        saved.append(getenv(name, ""))
+        _ = unsetenv(name)
+    _ = setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", imds)
+    try:
+        var role = S3Config.from_env()
+        assert_equal(role.credentials.access_key_id, "ASIAMOCKIMDSKEY")
+        assert_equal(role.credentials.secret_access_key, "mock/imds/secret")
+        assert_equal(role.credentials.session_token, "mock-imds-session-token")
+        assert_true(not role.anonymous)
+        # Cached: the same answer again.
+        var again = instance_credentials()
+        assert_true(Bool(again))
+        assert_equal(again.value().access_key_id, "ASIAMOCKIMDSKEY")
+
+        _ = setenv("AWS_ACCESS_KEY_ID", "env-key")
+        _ = setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
+        assert_equal(S3Config.from_env().credentials.access_key_id, "env-key")
+        _ = unsetenv("AWS_ACCESS_KEY_ID")
+        _ = unsetenv("AWS_SECRET_ACCESS_KEY")
+
+        _ = setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:1")
+        assert_true(S3Config.from_env().anonymous)
+        _ = unsetenv("AWS_ENDPOINT_URL")
+
+        _ = setenv("AWS_EC2_METADATA_DISABLED", "true")
+        assert_true(S3Config.from_env().anonymous)
+        assert_true(not instance_credentials())
+    finally:
+        var i = 0
+        for name in materialize[_ROLE_ENV]():
+            _set_env(name, saved[i])
+            i += 1
 
 
 def main() raises:

@@ -3,7 +3,8 @@
 # Builds the test binary, brings up the servers the tests need, runs them, and
 # tears everything down.
 #
-# Two servers:
+# Three servers:
+#   * tests/imds_server.py — an IMDSv2 mock for the EC2 instance-role tests.
 #   * tests/http_server.py — the HTTP client tests (all verbs, ranges, error
 #     statuses, timeouts). Always available; python is a workspace dependency.
 #   * an S3 server for the s3.mojo tests. MinIO is strongly preferred because
@@ -58,6 +59,19 @@ export OBJECTSTORE_TEST_WWW="$WORK/www"
 export OBJECTSTORE_TEST_DIR="$WORK/scratch"
 mkdir -p "$OBJECTSTORE_TEST_DIR"
 echo "== http server at $OBJECTSTORE_TEST_HTTP"
+
+# ── instance metadata ──────────────────────────────────────────────────────
+# Nothing here runs on EC2, so the instance-role lookup is off for every test
+# but the one that turns it back on against this mock.
+export AWS_EC2_METADATA_DISABLED=true
+python tests/imds_server.py > "$WORK/imds.url" &
+PIDS+=($!)
+for _ in $(seq 1 100); do
+    [ -s "$WORK/imds.url" ] && break
+    sleep 0.1
+done
+export OBJECTSTORE_TEST_IMDS="$(cat "$WORK/imds.url")"
+echo "== instance metadata mock at $OBJECTSTORE_TEST_IMDS"
 
 # ── S3 server ──────────────────────────────────────────────────────────────
 S3_PORT=$(python -c "
