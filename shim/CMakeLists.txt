@@ -15,6 +15,9 @@ add_library(objectstoremojo SHARED curl_wrapper.c)
 # 2.34 these live in libc, but CMAKE_DL_LIBS covers the platforms where they
 # do not.
 target_link_libraries(objectstoremojo PRIVATE ${CMAKE_DL_LIBS})
+# The instance-credential cache is behind a pthread mutex.
+find_package(Threads REQUIRED)
+target_link_libraries(objectstoremojo PRIVATE Threads::Threads)
 if(TARGET CURL::libcurl)
     target_link_libraries(objectstoremojo PRIVATE CURL::libcurl)
 else()

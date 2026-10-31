@@ -445,6 +445,17 @@ struct FileIOResolver(Copyable, Movable):
             self.azure_config_for(target, az.account), self.http.copy()
         ).output(az.container, az.path)
 
+    def _s3_config_if(self, backend: Int, location: String) raises -> S3Config:
+        """The location's S3 configuration if it is on S3, else a blank one.
+
+        Every open file carries an `S3Client`, but only an S3 file uses it.
+        Resolving the configuration can ask the instance metadata service for
+        credentials, which a local or HTTP file has no business waiting on.
+        """
+        if backend == BACKEND_S3:
+            return self.s3_config_for(location)
+        return S3Config()
+
     def new_input(self, location: String) raises -> AnyInputFile:
         var target = self.resolve(location)
         var backend = self.backend_for(location)
@@ -467,7 +478,7 @@ struct FileIOResolver(Copyable, Movable):
             target,
             LocalInputFile(u.local_path() if backend == BACKEND_LOCAL else ""),
             http_file^,
-            S3Client(self.s3_config_for(location), self.http.copy()),
+            S3Client(self._s3_config_if(backend, location), self.http.copy()),
             bucket^,
             key^,
         )
@@ -492,7 +503,7 @@ struct FileIOResolver(Copyable, Movable):
             target,
             LocalOutputFile(u.local_path() if backend == BACKEND_LOCAL else ""),
             http_file^,
-            S3Client(self.s3_config_for(location), self.http.copy()),
+            S3Client(self._s3_config_if(backend, location), self.http.copy()),
             bucket^,
             key^,
         )

@@ -11,18 +11,26 @@ most S3-compatible servers default to, and what a bucket name with dots forces
 even on AWS. `S3Config.path_style` picks, and a custom `endpoint` makes this
 work against MinIO, R2 or anything else that speaks the protocol.
 
-Credentials come from four places, in the order a caller should expect:
-explicit properties, the `AWS_*` environment, REST-catalog **vended
-credentials** (which are just properties under a location prefix — see
-`fileio.FileIOResolver`), and presigned URLs, which carry the signature in the
-query string and need no credentials at the point of use at all.
+Credentials come from five places, in the order a caller should expect:
+explicit properties, the `AWS_*` environment, the **EC2 instance role**
+(IMDSv2, when neither of those set a key and no custom endpoint is
+configured), REST-catalog **vended credentials** (which are just properties
+under a location prefix — see `fileio.FileIOResolver`), and presigned URLs,
+which carry the signature in the query string and need no credentials at the
+point of use at all.
+
+The instance role is what AWS SDKs fall back to as well. The shim does the
+lookup and caches it for the process, "not on EC2" included, until five
+minutes before the credentials expire. `AWS_EC2_METADATA_DISABLED=true` turns
+it off and `AWS_EC2_METADATA_SERVICE_ENDPOINT` points it elsewhere. From a
+container, the instance's metadata hop limit must be at least 2.
 """
 
 from std.collections import Dict
 from std.os import getenv
 
 from .crypto import sha256_hex
-from .http import Header, HttpClient, Response
+from .http import Header, HttpClient, Response, instance_credentials_blob
 from .path import Uri, parse_uri, url_encode
 from .sigv4 import (
     AmzTime,
@@ -64,6 +72,18 @@ struct S3Credentials(Copyable, Movable):
 
     def is_set(self) -> Bool:
         return self.access_key_id != "" and self.secret_access_key != ""
+
+
+def instance_credentials() raises -> Optional[S3Credentials]:
+    """The EC2 instance role's credentials, or `None` off EC2, without a role,
+    or with `AWS_EC2_METADATA_DISABLED=true`."""
+    var blob = instance_credentials_blob()
+    if blob == "":
+        return None
+    var parts = blob.split("\n")
+    if len(parts) < 3:
+        return None
+    return S3Credentials(String(parts[0]), String(parts[1]), String(parts[2]))
 
 
 struct S3Config(Copyable, Movable):
@@ -145,6 +165,12 @@ struct S3Config(Copyable, Movable):
             c.path_style = True
         if _truthy(getenv("AWS_S3_FORCE_PATH_STYLE", "")):
             c.path_style = True
+        # A custom endpoint is MinIO, R2 or the like, never a place the
+        # instance role would sign for.
+        if not c.credentials.is_set() and c.endpoint == "":
+            var role = instance_credentials()
+            if role:
+                c.credentials = role.take()
         c.anonymous = not c.credentials.is_set()
         return c^
 

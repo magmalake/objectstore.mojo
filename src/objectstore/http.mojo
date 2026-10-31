@@ -147,10 +147,37 @@ def reset_pool_stats(pool: Int = SHARED_POOL) raises:
 
 
 def shim_abi() raises -> Int:
-    """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections."""
+    """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections;
+    3 = `instance_credentials_blob`."""
     var lib = OwnedDLHandle(_find_lib())
     var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
     return Int(abi_fn())
+
+
+def instance_credentials_blob() raises -> String:
+    """The EC2 instance role's credentials, as the shim's IMDSv2 lookup hands
+    them back: `access-key-id\nsecret\ntoken\nexpiry-epoch`, or `""` when
+    there are none.
+
+    The shim caches the answer for the process, "none" included, so this is
+    cheap to call per request. A shim older than ABI 3 has no lookup and
+    answers `""` as well.
+    """
+    var lib = OwnedDLHandle(_find_lib())
+    return _instance_credentials(lib)
+
+
+def _instance_credentials(imm lib: OwnedDLHandle) raises -> String:
+    var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
+    if Int(abi_fn()) < 3:
+        return String()
+    var creds_fn = lib.get_function[c_long]("os_imds_credentials")
+    var buf = List[UInt8](length=8192, fill=0)
+    var n = Int(creds_fn(Int(buf.unsafe_ptr()), c_size_t(len(buf))))
+    if n <= 0:
+        return String()
+    buf.resize(n, 0)
+    return String(StringSlice(unsafe_from_utf8=Span(buf)))
 
 
 # ---------------------------------------------------------------------------

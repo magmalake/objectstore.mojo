@@ -46,6 +46,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <strings.h>
+#include <pthread.h>
 #ifndef _WIN32
 #include <dlfcn.h>
 /* Absent on a platform without it: dlopen alone still pins us, because the
@@ -459,5 +461,179 @@ const char *os_http_curl_version(void) { return curl_version(); }
  */
 long long os_time_epoch(void) { return (long long)time(NULL); }
 
-/* 1 = 0.1.x (one easy handle per request); 2 = pooled clients. */
-long os_http_shim_abi(void) { return 2; }
+/* ------------------------------------------------------------------------ */
+/* EC2 instance-role credentials (IMDSv2)                                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * On EC2 the instance's IAM role hands out temporary credentials through the
+ * instance metadata service: PUT a session token, then GET the role's name and
+ * its credentials with that token (IMDSv2; v1's unauthenticated GETs aren't
+ * used). AWS SDKs fall back to this when nothing else configures credentials,
+ * and so does S3Config.from_env.
+ *
+ * This lives here rather than in Mojo for the cache: the credentials last
+ * hours, every FileIO resolution asks for them, and a machine that isn't on
+ * EC2 should pay the connect timeout once per process, not once per file. The
+ * cache is process-wide and behind a mutex. It keeps an answer, including "not
+ * available", until five minutes before the credentials expire, and forgets
+ * it if the endpoint changes (which only the tests do).
+ *
+ * The lookup uses an easy handle of its own: the default client is not thread
+ * safe, and these requests must never go through a proxy.
+ */
+
+#define IMDS_FIELD 2048
+
+static pthread_mutex_t g_imds_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_imds_known = 0;        /* an answer is cached */
+static int g_imds_found = 0;        /* ... and it is credentials */
+static long long g_imds_refresh = 0; /* epoch after which to ask again */
+static char g_imds_endpoint[512];
+static char g_imds_creds[3 * IMDS_FIELD + 64];
+
+static int imds_get(CURL *h, const char *method, const char *url,
+                    const char *header, os_buf *out) {
+    struct curl_slist *hl = header ? curl_slist_append(NULL, header) : NULL;
+    out->len = 0;
+    curl_easy_reset(h);
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+    if (strcmp(method, "PUT") == 0) {
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, 0L);
+    }
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hl);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, (void *)out);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_NOPROXY, "*");
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 2000L);
+    CURLcode rc = curl_easy_perform(h);
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    if (hl) curl_slist_free_all(hl);
+    return rc == CURLE_OK && status == 200 && !out->oom;
+}
+
+/* The string value of "key" in a flat JSON object, unescaped only as far as
+   these values need (they never contain escapes). */
+static int json_field(const char *json, const char *key, char *out, size_t cap) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return 0;
+    p = strchr(p, '"');
+    if (!p) return 0;
+    const char *end = strchr(p + 1, '"');
+    if (!end || (size_t)(end - p - 1) >= cap) return 0;
+    memcpy(out, p + 1, (size_t)(end - p - 1));
+    out[end - p - 1] = 0;
+    return 1;
+}
+
+static long long parse_iso8601(const char *s) {
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    if (sscanf(s, "%d-%d-%dT%d:%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6)
+        return 0;
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+    return (long long)timegm(&tm);
+}
+
+/* Fills g_imds_creds; returns 1 on success. Called with the lock held. */
+static int imds_fetch(const char *endpoint) {
+    int ok = 0;
+    char url[1024];
+    char header[2200];
+    os_buf b;
+    buf_init(&b);
+    CURL *h = curl_easy_init();
+    if (!h) return 0;
+
+    snprintf(url, sizeof(url), "%s/latest/api/token", endpoint);
+    if (!imds_get(h, "PUT", url, "X-aws-ec2-metadata-token-ttl-seconds: 21600", &b))
+        goto done;
+    if (b.len == 0 || b.len > 1024) goto done;
+    snprintf(header, sizeof(header), "X-aws-ec2-metadata-token: %.*s",
+             (int)b.len, (const char *)b.data);
+
+    snprintf(url, sizeof(url), "%s/latest/meta-data/iam/security-credentials/",
+             endpoint);
+    if (!imds_get(h, "GET", url, header, &b) || b.len == 0 || b.len > 256) goto done;
+    char role[257];
+    size_t n = 0;
+    while (n < b.len && b.data[n] != '\n' && b.data[n] != '\r') {
+        role[n] = (char)b.data[n];
+        n++;
+    }
+    role[n] = 0;
+    if (n == 0) goto done;
+
+    snprintf(url, sizeof(url), "%s/latest/meta-data/iam/security-credentials/%s",
+             endpoint, role);
+    if (!imds_get(h, "GET", url, header, &b)) goto done;
+    if (!buf_append(&b, "", 1)) goto done; /* NUL-terminate */
+    char akid[IMDS_FIELD], secret[IMDS_FIELD], token[IMDS_FIELD], expires[64];
+    if (!json_field((const char *)b.data, "AccessKeyId", akid, sizeof(akid)) ||
+        !json_field((const char *)b.data, "SecretAccessKey", secret, sizeof(secret)) ||
+        !json_field((const char *)b.data, "Token", token, sizeof(token)) ||
+        !json_field((const char *)b.data, "Expiration", expires, sizeof(expires)))
+        goto done;
+    long long expiry = parse_iso8601(expires);
+    snprintf(g_imds_creds, sizeof(g_imds_creds), "%s\n%s\n%s\n%lld", akid,
+             secret, token, expiry);
+    /* Ask again five minutes before they expire. */
+    g_imds_refresh = expiry - 300;
+    ok = 1;
+done:
+    free(b.data);
+    curl_easy_cleanup(h);
+    return ok;
+}
+
+/*
+ * The instance role's credentials as "access-key-id\nsecret\ntoken\nexpiry"
+ * (expiry in epoch seconds), written to `out`; returns their length, or 0
+ * when there are none (not on EC2, no role, AWS_EC2_METADATA_DISABLED=true)
+ * or `out` is too small.
+ */
+long os_imds_credentials(char *out, size_t cap) {
+    const char *disabled = getenv("AWS_EC2_METADATA_DISABLED");
+    if (disabled && (strcasecmp(disabled, "true") == 0 || strcmp(disabled, "1") == 0))
+        return 0;
+    const char *endpoint = getenv("AWS_EC2_METADATA_SERVICE_ENDPOINT");
+    if (!endpoint || !*endpoint) endpoint = "http://169.254.169.254";
+    ensure_global();
+
+    long n = 0;
+    pthread_mutex_lock(&g_imds_lock);
+    long long now = (long long)time(NULL);
+    int stale = !g_imds_known || strcmp(g_imds_endpoint, endpoint) != 0 ||
+                (g_imds_found && now >= g_imds_refresh);
+    if (stale) {
+        g_imds_found = imds_fetch(endpoint);
+        g_imds_known = 1;
+        snprintf(g_imds_endpoint, sizeof(g_imds_endpoint), "%s", endpoint);
+    }
+    if (g_imds_found) {
+        size_t len = strlen(g_imds_creds);
+        if (len < cap) {
+            memcpy(out, g_imds_creds, len + 1);
+            n = (long)len;
+        }
+    }
+    pthread_mutex_unlock(&g_imds_lock);
+    return n;
+}
+
+/*
+ * 1 = 0.1.x (one easy handle per request); 2 = pooled clients;
+ * 3 = os_imds_credentials.
+ */
+long os_http_shim_abi(void) { return 3; }
