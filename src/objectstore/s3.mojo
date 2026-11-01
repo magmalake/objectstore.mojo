@@ -30,7 +30,13 @@ from std.collections import Dict
 from std.os import getenv
 
 from .crypto import sha256_hex
-from .http import Header, HttpClient, Response, instance_credentials_blob
+from .http import (
+    BatchRequest,
+    Header,
+    HttpClient,
+    Response,
+    instance_credentials_blob,
+)
 from .path import Uri, parse_uri, url_encode
 from .sigv4 import (
     AmzTime,
@@ -581,6 +587,70 @@ struct S3Client(Copyable, Movable):
                 + s3_error_message(r)
             )
         return r.body.copy()
+
+    def signed_get(
+        self,
+        bucket: String,
+        key: String,
+        range_start: Int = -1,
+        range_end: Int = -1,
+    ) raises -> BatchRequest:
+        """A signed `GET` of the object or the inclusive range `[start, end]`,
+        to send in a batch."""
+        var addr = self.url_for(bucket, key)
+        var headers = self._signed_headers(
+            "GET",
+            addr[1],
+            addr[2],
+            List[QueryParam](),
+            EMPTY_SHA256,
+            List[Header](),
+        )
+        return BatchRequest.get(addr[0], headers^, range_start, range_end)
+
+    def get_many(
+        self, reqs: List[BatchRequest], what: List[String]
+    ) raises -> List[List[UInt8]]:
+        """Runs signed `GET`s at once; raises naming `what[i]` for the first
+        that failed."""
+        var resps = self.http.request_many(reqs)
+        var out = List[List[UInt8]](capacity=len(resps))
+        for k in range(len(resps)):
+            if not resps[k].ok():
+                raise Error(
+                    "s3: GET "
+                    + what[k]
+                    + ": HTTP "
+                    + String(resps[k].status)
+                    + " "
+                    + s3_error_message(resps[k])
+                )
+            var body = List[UInt8]()
+            swap(body, resps[k].body)
+            out.append(body^)
+        return out^
+
+    def get_ranges(
+        self, bucket: String, key: String, ranges: List[Tuple[Int, Int]]
+    ) raises -> List[List[UInt8]]:
+        """Several inclusive byte ranges `(start, end)` of one object, fetched
+        at once."""
+        var reqs = List[BatchRequest](capacity=len(ranges))
+        var what = List[String](capacity=len(ranges))
+        for k in range(len(ranges)):
+            reqs.append(
+                self.signed_get(bucket, key, ranges[k][0], ranges[k][1])
+            )
+            what.append(
+                bucket
+                + "/"
+                + key
+                + " bytes "
+                + String(ranges[k][0])
+                + "-"
+                + String(ranges[k][1])
+            )
+        return self.get_many(reqs, what)
 
     def head_object(self, bucket: String, key: String) raises -> Response:
         return self.request("HEAD", bucket, key)

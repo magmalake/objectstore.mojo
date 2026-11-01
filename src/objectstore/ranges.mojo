@@ -172,14 +172,33 @@ def read_ranges_coalesced[
     ranges: List[ByteRange],
     max_gap: Int = DEFAULT_COALESCE_GAP,
 ) raises -> List[List[UInt8]]:
-    """Fetches the plan's groups and slices the caller's ranges back out."""
+    """Fetches the plan's groups one by one and slices the caller's ranges
+    back out. Backends that can fetch groups at once do that instead and call
+    `assemble`."""
     var plan = plan_ranges(ranges, max_gap)
     var buffers = List[List[UInt8]]()
     for k in range(len(plan.fetches)):
         buffers.append(
             reader.read_range(plan.fetches[k].offset, plan.fetches[k].length)
         )
+    return assemble(reader, plan, ranges, buffers^)
 
+
+def assemble[
+    T: RangeReader
+](
+    reader: T,
+    plan: CoalescedPlan,
+    ranges: List[ByteRange],
+    var buffers: List[List[UInt8]],
+) raises -> List[List[UInt8]]:
+    """The caller's ranges, in order, cut from `buffers` (one per fetch of
+    `plan`). A range a fetch answers exactly gets that buffer, uncopied; a
+    suffix or empty range, which no fetch covers, is read on its own."""
+    var members = List[Int](length=len(plan.fetches), fill=0)
+    for k in range(len(ranges)):
+        if plan.group[k] >= 0:
+            members[plan.group[k]] += 1
     var out = List[List[UInt8]]()
     for k in range(len(ranges)):
         var g = plan.group[k]
@@ -188,6 +207,11 @@ def read_ranges_coalesced[
             out.append(reader.read_range(ranges[k].offset, ranges[k].length))
             continue
         var at = plan.group_offset[k]
+        if members[g] == 1 and at == 0 and len(buffers[g]) == ranges[k].length:
+            var whole = List[UInt8]()
+            swap(whole, buffers[g])
+            out.append(whole^)
+            continue
         var stop = at + ranges[k].length
         # A server may answer a range with fewer bytes than asked for; slicing
         # past the end would be a crash rather than a short read.

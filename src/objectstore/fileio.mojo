@@ -27,7 +27,7 @@ from std.collections import Dict
 
 from .azure import AzureClient, AzureConfig, parse_azure_uri
 from .gcs import GcsClient, GcsConfig, split_gcs_uri
-from .http import Header, HttpClient
+from .http import BatchRequest, Header, HttpClient
 from .httpio import HttpInputFile, HttpOutputFile, http_delete
 from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
 from .path import Uri, parse_uri
@@ -35,6 +35,8 @@ from .ranges import (
     ByteRange,
     DEFAULT_COALESCE_GAP,
     RangeReader,
+    assemble,
+    plan_ranges,
     read_ranges_coalesced,
 )
 from .s3 import S3Client, S3Config, split_s3_uri
@@ -204,7 +206,8 @@ struct AnyInputFile(Copyable, InputFile, Movable, RangeReader):
         )
 
     def read_ranges(self, ranges: List[ByteRange]) raises -> List[List[UInt8]]:
-        """Coalesced for HTTP and S3, one seek per range for local files."""
+        """One seek per range for local files. For HTTP and S3, nearby ranges
+        are coalesced and the groups fetched at once."""
         if self.backend == BACKEND_LOCAL:
             var out = List[List[UInt8]]()
             for k in range(len(ranges)):
@@ -212,7 +215,14 @@ struct AnyInputFile(Copyable, InputFile, Movable, RangeReader):
                     self._local.read_range(ranges[k].offset, ranges[k].length)
                 )
             return out^
-        return read_ranges_coalesced(self, ranges)
+        if self.backend == BACKEND_HTTP:
+            return self._http.read_ranges(ranges)
+        var plan = plan_ranges(ranges)
+        var spans = List[Tuple[Int, Int]](capacity=len(plan.fetches))
+        for ref f in plan.fetches:
+            spans.append((f.offset, f.offset + f.length - 1))
+        var bufs = self._s3.get_ranges(self._bucket, self._key, spans)
+        return assemble(self, plan, ranges, bufs^)
 
 
 struct AnyOutputFile(Copyable, Movable, OutputFile):
@@ -606,6 +616,39 @@ struct FileIOResolver(Copyable, Movable):
         once rather than once per range.
         """
         return self.new_input(location).read_ranges(ranges)
+
+    def read_all_many(
+        self, locations: List[String]
+    ) raises -> List[List[UInt8]]:
+        """Several whole objects, in order. Those on S3 are fetched at once;
+        the rest one by one. For many small files read together, such as an
+        Iceberg table's manifests."""
+        var out = List[List[UInt8]](capacity=len(locations))
+        var s3_at = List[Int]()
+        var reqs = List[BatchRequest]()
+        var what = List[String]()
+        var client = Optional[S3Client](None)
+        for k in range(len(locations)):
+            var loc = locations[k]
+            out.append(List[UInt8]())
+            if self.backend_for(loc) != BACKEND_S3:
+                out[k] = self.read_all(loc)
+                continue
+            var target = self.resolve(loc)
+            var parts = split_s3_uri(target)
+            # Each request is signed with its own location's configuration;
+            # the batch runs on whichever client signed first.
+            var c = S3Client(self.s3_config_for(loc), self.http.copy())
+            reqs.append(c.signed_get(parts[0], parts[1]))
+            what.append(target)
+            s3_at.append(k)
+            if not client:
+                client = c^
+        if len(reqs) > 0:
+            var got = client.value().get_many(reqs, what)
+            for i in range(len(s3_at)):
+                swap(out[s3_at[i]], got[i])
+        return out^
 
     def read_text(self, location: String) raises -> String:
         var data = self.new_input(location).read_all()

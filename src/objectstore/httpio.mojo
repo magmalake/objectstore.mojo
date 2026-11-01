@@ -12,8 +12,8 @@ That is handled rather than trusted: a `200` where a `206` was expected is
 sliced locally, so the caller always gets the bytes it asked for.
 """
 
-from .http import Header, HttpClient, Response
-from .ranges import ByteRange, RangeReader, read_ranges_coalesced
+from .http import BatchRequest, Header, HttpClient, Response
+from .ranges import ByteRange, RangeReader, assemble, plan_ranges
 
 
 @fieldwise_init
@@ -117,9 +117,36 @@ struct HttpInputFile(Copyable, Movable, RangeReader):
         row group whose column chunks are laid out consecutively becomes a
         single `Range` request, and the bytes of the columns the scan skipped
         are read and thrown away — which is cheaper than the round trip that
-        would have avoided them.
+        would have avoided them. The groups are fetched at once.
         """
-        return read_ranges_coalesced(self, ranges)
+        var plan = plan_ranges(ranges)
+        var reqs = List[BatchRequest](capacity=len(plan.fetches))
+        for ref f in plan.fetches:
+            reqs.append(
+                BatchRequest.get(
+                    self.url,
+                    self.headers.copy(),
+                    f.offset,
+                    f.offset + f.length - 1,
+                )
+            )
+        var resps = self.client.request_many(reqs)
+        var bufs = List[List[UInt8]](capacity=len(resps))
+        for k in range(len(resps)):
+            resps[k].raise_for_status("objectstore.httpio: GET " + self.url)
+            if resps[k].status == 206:
+                var body = List[UInt8]()
+                swap(body, resps[k].body)
+                bufs.append(body^)
+                continue
+            # 200: the server ignored the Range and sent everything.
+            ref f = plan.fetches[k]
+            var end = min(f.offset + f.length, len(resps[k].body))
+            var piece = List[UInt8]()
+            if f.offset < end:
+                piece.extend(Span(resps[k].body)[f.offset : end])
+            bufs.append(piece^)
+        return assemble(self, plan, ranges, bufs^)
 
 
 @fieldwise_init

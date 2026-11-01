@@ -365,6 +365,22 @@ Input order is preserved, a suffix range (`offset < 0`) is left on its own
 because where it lands is not known until the length is, and a short read is
 truncated rather than sliced past the end.
 
+**The groups are fetched at once.** Row groups are megabytes apart, so a
+scan's groups don't coalesce into one, and on S3 each request waits tens of
+milliseconds before its first byte. HTTP and S3 files send all of a read's
+groups together, as a batch (`HttpClient.request_many`), and return once every
+one has answered: one thread, curl's multi interface underneath, up to
+`DEFAULT_MAX_PARALLEL` (16) in flight, on connections a persistent multi
+handle keeps open from one batch to the next. A request that fails in
+transport or gets a retryable status is tried again on its own under the
+client's `RetryPolicy`. Four row groups' worth of a column, with 30 ms of
+latency per request on loopback: 145 ms one by one, 43 ms at once.
+
+`FileIOResolver.read_all_many(locations)` does the same for whole objects,
+each signed for its own location: an Iceberg table's manifests, read for one
+plan. A shim older than ABI 4 has no batches, and both fall back to one
+request at a time.
+
 ## GCS and Azure
 
 Both are implemented, and both are deliberately narrow: they cover the case

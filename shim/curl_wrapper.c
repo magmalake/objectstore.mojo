@@ -632,8 +632,239 @@ long os_imds_credentials(char *out, size_t cap) {
     return n;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Batches: several GETs in flight at once                                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A request is mostly waiting: on S3 a range GET spends tens of milliseconds
+ * before its first byte, so a Parquet file read one column chunk after
+ * another is a sum of latencies. A batch sends its requests together through
+ * curl's multi interface, on one thread, and returns when all have finished.
+ *
+ * The multi handle persists for the process, like the default client's easy
+ * handle: its connection cache is what keeps sockets (and TLS sessions) open
+ * from one batch to the next. Each request gets its own easy handle, created
+ * and destroyed with the batch; the connections outlive them in the cache.
+ * Same thread rules as everything else here: one batch at a time.
+ */
+
+typedef struct {
+    CURL *easy;
+    os_http_result *r;
+    struct curl_slist *hdrs;
+    char range[64];
+    char errbuf[CURL_ERROR_SIZE];
+} os_batch_item;
+
+/* Items are allocated one by one: curl holds pointers into each (its error
+   buffer, CURLOPT_PRIVATE), so they must not move as the batch grows. */
+typedef struct {
+    os_batch_item **items;
+    size_t n;
+    size_t cap;
+} os_http_batch;
+
+static CURLM *g_multi = NULL;
+static long g_multi_requests = 0;
+static long g_multi_connects = 0;
+
+os_http_batch *os_http_batch_new(void) {
+    ensure_global();
+    return (os_http_batch *)calloc(1, sizeof(os_http_batch));
+}
+
+static void batch_item_clear(os_batch_item *it) {
+    if (it->easy) {
+        if (g_multi) curl_multi_remove_handle(g_multi, it->easy);
+        curl_easy_cleanup(it->easy);
+        it->easy = NULL;
+    }
+    if (it->hdrs) {
+        curl_slist_free_all(it->hdrs);
+        it->hdrs = NULL;
+    }
+}
+
+/*
+ * Adds a GET (or HEAD) for `url`. `range_start`/`range_end` mean what they
+ * mean to os_http_request_ex; `expect_len` > 0 sizes the body buffer up front,
+ * so a range of known length is received without reallocating. Returns the
+ * request's index in the batch, or -1 if it could not be set up.
+ */
+long os_http_batch_add(os_http_batch *b,
+                       const char *method,
+                       const char *url,
+                       const char *headers_blob,
+                       long long range_start,
+                       long long range_end,
+                       long long expect_len,
+                       long timeout_ms,
+                       int verify_tls) {
+    if (!b) return -1;
+    if (b->n == b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 16;
+        os_batch_item **p =
+            (os_batch_item **)realloc(b->items, cap * sizeof(os_batch_item *));
+        if (!p) return -1;
+        b->items = p;
+        b->cap = cap;
+    }
+    os_batch_item *it = (os_batch_item *)calloc(1, sizeof(os_batch_item));
+    if (!it) return -1;
+    it->r = (os_http_result *)calloc(1, sizeof(os_http_result));
+    if (!it->r) {
+        free(it);
+        return -1;
+    }
+    buf_init(&it->r->body);
+    buf_init(&it->r->headers);
+    if (expect_len > 0) {
+        it->r->body.data = (unsigned char *)malloc((size_t)expect_len + 1);
+        if (it->r->body.data) it->r->body.cap = (size_t)expect_len + 1;
+    }
+    it->easy = curl_easy_init();
+    if (!it->easy) {
+        os_http_result_free(it->r);
+        free(it);
+        return -1;
+    }
+    CURL *h = it->easy;
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_ERRORBUFFER, it->errbuf);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, (void *)&it->r->body);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, (void *)&it->r->headers);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    if (g_share) curl_easy_setopt(h, CURLOPT_SHARE, g_share);
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPINTVL, 15L);
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "objectstore.mojo/0.2");
+    if (timeout_ms > 0) {
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, timeout_ms);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS,
+                         timeout_ms < 10000 ? timeout_ms : 10000L);
+    }
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, verify_tls ? 1L : 0L);
+    curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, verify_tls ? 2L : 0L);
+    if (method && strcmp(method, "HEAD") == 0)
+        curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    if (range_start >= 0) {
+        if (range_end >= 0)
+            snprintf(it->range, sizeof(it->range), "%lld-%lld", range_start,
+                     range_end);
+        else
+            snprintf(it->range, sizeof(it->range), "%lld-", range_start);
+        curl_easy_setopt(h, CURLOPT_RANGE, it->range);
+    }
+    it->hdrs = build_headers(headers_blob);
+    if (it->hdrs) curl_easy_setopt(h, CURLOPT_HTTPHEADER, it->hdrs);
+    curl_easy_setopt(h, CURLOPT_PRIVATE, (void *)it);
+    b->items[b->n] = it;
+    b->n += 1;
+    return (long)(b->n - 1);
+}
+
+/*
+ * Runs every request added so far, at most `max_parallel` at a time (curl
+ * queues the rest), and returns once all have finished, each with its own
+ * outcome. Returns 0, or a CURLMcode if the multi interface itself failed.
+ */
+long os_http_batch_run(os_http_batch *b, long max_parallel) {
+    if (!b || b->n == 0) return 0;
+    if (!g_multi) {
+        g_multi = curl_multi_init();
+        if (!g_multi) return (long)CURLM_OUT_OF_MEMORY;
+    }
+    if (max_parallel < 1) max_parallel = 1;
+    curl_multi_setopt(g_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_parallel);
+    curl_multi_setopt(g_multi, CURLMOPT_MAX_HOST_CONNECTIONS, max_parallel);
+    curl_multi_setopt(g_multi, CURLMOPT_MAXCONNECTS, max_parallel + 16);
+    for (size_t i = 0; i < b->n; i++) {
+        os_batch_item *it = b->items[i];
+        it->r->rc = (int)CURLE_FAILED_INIT;
+        if (it->easy) curl_multi_add_handle(g_multi, it->easy);
+    }
+    int running = 1;
+    CURLMcode mc = CURLM_OK;
+    while (running) {
+        mc = curl_multi_perform(g_multi, &running);
+        if (mc != CURLM_OK) break;
+        if (running) mc = curl_multi_poll(g_multi, NULL, 0, 1000, NULL);
+        if (mc != CURLM_OK) break;
+    }
+    CURLMsg *msg;
+    int left;
+    while ((msg = curl_multi_info_read(g_multi, &left))) {
+        if (msg->msg != CURLMSG_DONE) continue;
+        os_batch_item *it = NULL;
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&it);
+        if (!it) continue;
+        os_http_result *r = it->r;
+        r->rc = (int)msg->data.result;
+        g_multi_requests += 1;
+        long opened = 0;
+        if (curl_easy_getinfo(it->easy, CURLINFO_NUM_CONNECTS, &opened) ==
+            CURLE_OK)
+            g_multi_connects += opened;
+        if (r->rc != CURLE_OK) {
+            snprintf(r->err, sizeof(r->err), "%s%s%s",
+                     curl_easy_strerror((CURLcode)r->rc),
+                     it->errbuf[0] ? ": " : "", it->errbuf[0] ? it->errbuf : "");
+        } else {
+            curl_easy_getinfo(it->easy, CURLINFO_RESPONSE_CODE, &r->status);
+            if (r->body.oom || r->headers.oom) {
+                r->rc = (int)CURLE_OUT_OF_MEMORY;
+                snprintf(r->err, sizeof(r->err),
+                         "out of memory buffering response");
+            }
+        }
+    }
+    for (size_t i = 0; i < b->n; i++) {
+        os_batch_item *it = b->items[i];
+        if (it->r->rc == (int)CURLE_FAILED_INIT && !it->r->err[0])
+            snprintf(it->r->err, sizeof(it->r->err), "request did not run%s%s",
+                     mc != CURLM_OK ? ": " : "",
+                     mc != CURLM_OK ? curl_multi_strerror(mc) : "");
+        batch_item_clear(it);
+    }
+    return mc == CURLM_OK ? 0 : (long)mc;
+}
+
+/* Hands request `i`'s result to the caller, who frees it with
+   os_http_result_free. NULL once taken. */
+os_http_result *os_http_batch_take(os_http_batch *b, long i) {
+    if (!b || i < 0 || (size_t)i >= b->n) return NULL;
+    os_http_result *r = b->items[i]->r;
+    b->items[i]->r = NULL;
+    return r;
+}
+
+void os_http_batch_free(os_http_batch *b) {
+    if (!b) return;
+    for (size_t i = 0; i < b->n; i++) {
+        batch_item_clear(b->items[i]);
+        if (b->items[i]->r) os_http_result_free(b->items[i]->r);
+        free(b->items[i]);
+    }
+    free(b->items);
+    free(b);
+}
+
+/* Requests batches have run, and connections they had to open: reuse across
+   batches keeps the second near zero. */
+long os_http_batch_requests(void) { return g_multi_requests; }
+long os_http_batch_connects(void) { return g_multi_connects; }
+void os_http_batch_reset_stats(void) {
+    g_multi_requests = 0;
+    g_multi_connects = 0;
+}
+
 /*
  * 1 = 0.1.x (one easy handle per request); 2 = pooled clients;
- * 3 = os_imds_credentials.
+ * 3 = os_imds_credentials; 4 = batches (os_http_batch_*).
  */
-long os_http_shim_abi(void) { return 3; }
+long os_http_shim_abi(void) { return 4; }
