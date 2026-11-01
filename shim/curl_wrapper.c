@@ -25,9 +25,12 @@
  * thread (a pthread key, cleaned up when the thread exits), so threads that
  * each read — an Iceberg scan decoding files on several workers — never share
  * an easy or multi handle. What they do share goes through the share handle,
- * which locks: DNS, TLS sessions and the connection cache, so a thread
- * started for one scan reuses the connections an earlier thread opened. A
- * client from os_http_client_new still belongs to one thread at a time.
+ * which locks: DNS and TLS sessions, so a new thread's first connection
+ * resumes a TLS session instead of starting over. Connections themselves stay
+ * with their thread: curl doesn't support sharing a connection cache between
+ * threads using it at once (CURL_LOCK_DATA_CONNECT), and doing so crashed a
+ * 16-thread scan inside curl_multi_perform. A client from
+ * os_http_client_new still belongs to one thread at a time.
  *
  * Build: shim/pixi.toml (pixi-build-cmake) -> $CONDA_PREFIX/lib/libobjectstoremojo.so
  */
@@ -203,8 +206,8 @@ static void global_init_once(void) {
     pthread_key_create(&g_thread_key, thread_state_free);
     /*
      * Shared across every client and thread, behind the lock callbacks: a
-     * resolver round trip, a TLS resumption and an open connection are each
-     * worth more than a mutex.
+     * resolver round trip and a TLS resumption are each worth more than a
+     * mutex. Not the connection cache: see the top of this file.
      */
     g_share = curl_share_init();
     if (g_share) {
@@ -212,7 +215,6 @@ static void global_init_once(void) {
         curl_share_setopt(g_share, CURLSHOPT_UNLOCKFUNC, share_unlock);
         curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
         curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-        curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
     }
     /* A private pool keeps its connections to itself, as promised. */
     g_share_private = curl_share_init();
@@ -861,9 +863,8 @@ long os_http_batch_run(os_http_batch *b, long max_parallel) {
     if (!multi) return (long)CURLM_OUT_OF_MEMORY;
     if (max_parallel < 1) max_parallel = 1;
     /*
-     * At most `max_parallel` in flight, added as others finish. curl's own
-     * MAX_TOTAL_CONNECTIONS can't do this: the connection cache lives in the
-     * share handle, where the multi's limits don't reach.
+     * At most `max_parallel` in flight, added as others finish, so a batch
+     * never opens more connections than that.
      */
     size_t next = 0;
     long in_flight = 0;
