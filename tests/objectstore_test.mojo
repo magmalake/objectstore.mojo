@@ -1898,6 +1898,49 @@ def test_s3_read_all_many() raises:
         io.delete(loc)
 
 
+def test_s3_read_ranges_many() raises:
+    """Three files' footers and chunks in one batch, each answered from its
+    own file, and a local file alongside."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_read_ranges_many: no S3 server")
+        return
+    var io = _minio_io()
+    var locs = List[String]()
+    var datas = List[List[UInt8]]()
+    var ranges = List[List[ByteRange]]()
+    for f in range(3):
+        var n = 3 * 1024 * 1024
+        var data = List[UInt8](capacity=n)
+        for i in range(n):
+            data.append(UInt8((i * 7 + f * 13) % 251))
+        var loc = String("s3://") + _s3_bucket() + "/many-ranges/f" + String(f)
+        io.write(loc, Span(data))
+        locs.append(loc)
+        var want: List[ByteRange] = [
+            ByteRange(100 + f, 5000),
+            ByteRange(2 * 1024 * 1024, 70_000),
+            ByteRange(n - 512 * 1024, 512 * 1024),
+        ]
+        ranges.append(want^)
+        datas.append(data^)
+    reset_batch_stats()
+    var got = io.read_ranges_many(locs, ranges)
+    assert_equal(len(got), 3)
+    for f in range(3):
+        assert_equal(len(got[f]), 3)
+        for k in range(3):
+            ref r = ranges[f][k]
+            assert_equal(len(got[f][k]), r.length)
+            for j in [0, r.length - 1]:
+                assert_equal(got[f][k][j], datas[f][r.offset + j])
+    if shim_abi() >= 4:
+        # The first range of each file stands alone; the other two are
+        # under 1 MiB apart and coalesce: two requests a file, one batch.
+        assert_equal(batch_stats()[0], 6)
+    for ref loc in locs:
+        io.delete(loc)
+
+
 def test_s3_virtual_host_addressing() raises:
     var vhost = getenv("OBJECTSTORE_TEST_S3_VHOST", "")
     if vhost == "":
