@@ -259,10 +259,12 @@ Two things this needed:
   itself the first time it is called.
 * **Threads.** Several threads can make requests at once (shim ABI 5): the
   process-wide pool and a batch's multi handle are per thread, cleaned up
-  when the thread exits, and what threads share — DNS, TLS sessions, open
-  connections — sits behind the share handle's locks, so a short-lived worker
-  thread still reuses connections. A private pool from `new_connection_pool`
-  keeps its connections to itself and belongs to one thread at a time.
+  when the thread exits, each with its own connections. What threads share —
+  DNS and TLS sessions — sits behind the share handle's locks, so a new
+  thread's first connection resumes a TLS session. Connections aren't
+  shared: curl doesn't support one connection cache in use by several
+  threads at once. A private pool from `new_connection_pool` belongs to one
+  thread at a time.
 
 The tests assert reuse from both ends rather than inferring it from a
 stopwatch: curl's own connection counter (`pool_stats` → `(requests,

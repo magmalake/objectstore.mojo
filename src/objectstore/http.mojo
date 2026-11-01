@@ -26,8 +26,9 @@ default; `new_connection_pool` hands out a private one for a caller that wants
 its connections kept apart.
 
 **Threads.** Requests can be made from several threads at once (shim ABI
-5): `SHARED_POOL` and a batch's multi handle are per thread in the shim, and
-what threads share — DNS, TLS sessions, open connections — sits behind locks.
+5): `SHARED_POOL` and a batch's multi handle are per thread in the shim, with
+their own connections, and what threads share — DNS and TLS sessions — sits
+behind locks.
 A private pool from `new_connection_pool` belongs to one thread at a time.
 
 **Batches.** `request_many` sends several requests at once and returns when
