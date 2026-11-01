@@ -41,17 +41,20 @@ from objectstore.fileio import (
 )
 from objectstore.gcs import GcsConfig, split_gcs_uri
 from objectstore.http import (
+    BatchRequest,
     Header,
     HttpClient,
     RetryPolicy,
     SHARED_POOL,
     backoff_delay_ms,
+    batch_stats,
     free_connection_pool,
     header_blob,
     is_idempotent,
     new_connection_pool,
     parse_headers,
     pool_stats,
+    reset_batch_stats,
     reset_pool_stats,
     retryable_status,
     s3_retryable_error,
@@ -826,6 +829,65 @@ def test_http_read_ranges_coalesce() raises:
         )
     if shim_abi() >= 2:
         assert_equal(pool_stats()[0], 3)
+
+
+def test_http_request_many() raises:
+    """Twenty ranges at once: each answer in its place, statuses included,
+    and the second batch on the first one's connections."""
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_http_request_many: no server")
+        return
+    if shim_abi() < 4:
+        print("SKIP test_http_request_many: shim older than ABI 4")
+        return
+    var c = HttpClient()
+    var reqs = List[BatchRequest]()
+    for k in range(20):
+        reqs.append(
+            BatchRequest.get(
+                base + "/files/digits.txt",
+                List[Header](),
+                k * 4000,
+                k * 4000 + 99,
+            )
+        )
+    reqs.append(BatchRequest.get(base + "/status/404"))
+    reqs.append(BatchRequest.get(base + "/files/hello.txt"))
+    reset_batch_stats()
+    var got = c.request_many(reqs, max_parallel=8)
+    assert_equal(len(got), 22)
+    for k in range(20):
+        assert_equal(got[k].status, 206)
+        assert_equal(
+            String(StringSlice(unsafe_from_utf8=Span(got[k].body))),
+            _digits(k * 4000, 100),
+        )
+    assert_equal(got[20].status, 404)
+    assert_equal(got[21].text(), "hello objectstore\n")
+    var first = batch_stats()
+    assert_equal(first[0], 22)
+    assert_true(first[1] >= 1 and first[1] <= 8, "at most 8 connections")
+    _ = c.request_many(reqs, max_parallel=8)
+    var second = batch_stats()
+    assert_equal(second[0], 44)
+    assert_equal(second[1], first[1], "the second batch opened nothing new")
+
+
+def test_http_request_many_transport_failure() raises:
+    """A request that can't connect raises once its retries are spent, like
+    `request`; the batch around it doesn't hide that."""
+    if shim_abi() < 4:
+        print("SKIP test_http_request_many_transport_failure: old shim")
+        return
+    var c = HttpClient()
+    c.retry = RetryPolicy.none()
+    c.timeout_ms = 2000
+    var reqs = List[BatchRequest]()
+    reqs.append(BatchRequest.get(String("http://127.0.0.1:9/nothing")))
+    reqs.append(BatchRequest.get(String("http://127.0.0.1:9/either")))
+    with assert_raises(contains="failed"):
+        _ = c.request_many(reqs)
 
 
 def test_resolver_read_ranges() raises:
@@ -1765,6 +1827,75 @@ def test_s3_read_ranges_coalesce() raises:
         # them; nine separate `read_range` calls would be nine.
         assert_equal(requests, 1)
     io.delete(loc)
+
+
+def _minio_io() -> FileIOResolver:
+    var io = FileIOResolver()
+    io.set(String("s3.endpoint"), _s3_endpoint())
+    io.set(String("s3.access-key-id"), getenv("AWS_ACCESS_KEY_ID", ""))
+    io.set(String("s3.secret-access-key"), getenv("AWS_SECRET_ACCESS_KEY", ""))
+    io.set(String("s3.region"), String("us-east-1"))
+    return io^
+
+
+def test_s3_read_ranges_at_once() raises:
+    """Ranges too far apart to coalesce, as a Parquet file's row groups are:
+    one signed GET each, all in flight together, bytes as asked."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_read_ranges_at_once: no S3 server")
+        return
+    var io = _minio_io()
+    var n = 8 * 1024 * 1024
+    var data = List[UInt8](capacity=n)
+    for i in range(n):
+        data.append(UInt8((i * 31 + 3) % 253))
+    var loc = String("s3://") + _s3_bucket() + "/ranges/row-groups.bin"
+    io.write(loc, Span(data))
+    var want = List[ByteRange]()
+    for k in range(5):
+        # 1.5 MiB apart: more than the 1 MiB coalescing gap.
+        want.append(ByteRange(k * 1536 * 1024, 200_000))
+    want.append(ByteRange(n - 8, 8))
+    reset_batch_stats()
+    var got = io.new_input(loc).read_ranges(want)
+    assert_equal(len(got), 6)
+    for k in range(len(want)):
+        assert_equal(len(got[k]), want[k].length)
+        for j in [0, want[k].length // 2, want[k].length - 1]:
+            assert_equal(got[k][j], data[want[k].offset + j])
+    if shim_abi() >= 4:
+        assert_equal(batch_stats()[0], 6)
+    io.delete(loc)
+
+
+def test_s3_read_all_many() raises:
+    """Twelve small objects in one batch, in the order asked, and a missing
+    one named in the error."""
+    if _s3_endpoint() == "":
+        print("SKIP test_s3_read_all_many: no S3 server")
+        return
+    var io = _minio_io()
+    var locs = List[String]()
+    for k in range(12):
+        var loc = String("s3://") + _s3_bucket() + "/many/m-" + String(k)
+        io.write(loc, String("manifest ", k).as_bytes())
+        locs.append(loc)
+    reset_batch_stats()
+    var got = io.read_all_many(locs)
+    assert_equal(len(got), 12)
+    for k in range(12):
+        assert_equal(
+            String(StringSlice(unsafe_from_utf8=Span(got[k]))),
+            String("manifest ", k),
+        )
+    if shim_abi() >= 4:
+        assert_equal(batch_stats()[0], 12)
+    var bad = locs.copy()
+    bad.append(String("s3://") + _s3_bucket() + "/many/missing")
+    with assert_raises(contains="many/missing"):
+        _ = io.read_all_many(bad)
+    for ref loc in locs:
+        io.delete(loc)
 
 
 def test_s3_virtual_host_addressing() raises:

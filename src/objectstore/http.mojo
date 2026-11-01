@@ -30,6 +30,11 @@ Mojo has no threads today, so this costs nothing and is why the shim's share
 handle installs no locking callbacks; if that changes, each thread needs its
 own pool.
 
+**Batches.** `request_many` sends several requests at once and returns when
+all have answered: one thread, curl's multi interface underneath, its own
+persistent connections. A ranged read of a Parquet file is mostly waiting for
+first bytes, so overlapping the waits is most of the speed there is to have.
+
 **Retries.** Transport failures, 429 and most 5xx are retried with exponential
 backoff and jitter, but only for requests that can safely be repeated — see
 `RetryPolicy`. A response that is *returned* is never retried behind the
@@ -40,6 +45,12 @@ from std.ffi import OwnedDLHandle, c_int, c_long, c_long_long, c_size_t
 from std.os import getenv
 from std.time import monotonic, sleep
 
+
+comptime DEFAULT_MAX_PARALLEL = 16
+"""Requests a batch keeps in flight at once, on as many connections. The Rust
+Iceberg reader keeps 10 range reads in flight per file; S3 serves each
+connection at roughly 100 MB/s, so 16 covers a node's share of bandwidth
+without opening sockets by the hundred."""
 
 comptime DEFAULT_TIMEOUT_MS = 30000
 """Total request deadline. Range reads of a Parquet footer are small; a 20 MB
@@ -148,7 +159,7 @@ def reset_pool_stats(pool: Int = SHARED_POOL) raises:
 
 def shim_abi() raises -> Int:
     """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections;
-    3 = `instance_credentials_blob`."""
+    3 = `instance_credentials_blob`; 4 = batches (`request_many`)."""
     var lib = OwnedDLHandle(_find_lib())
     var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
     return Int(abi_fn())
@@ -518,10 +529,6 @@ def _do_request(
         raise Error("objectstore.http: out of memory allocating result")
 
     var rc_fn = lib.get_function[c_long]("os_http_result_rc")
-    var status_fn = lib.get_function[c_long]("os_http_result_status")
-    var body_fn = lib.get_function[Int]("os_http_result_body")
-    var body_len_fn = lib.get_function[c_size_t]("os_http_result_body_len")
-    var hdr_fn = lib.get_function[Int]("os_http_result_headers")
     var err_fn = lib.get_function[Int]("os_http_result_error")
     var free_fn = lib.get_function[NoneType]("os_http_result_free")
 
@@ -532,7 +539,16 @@ def _do_request(
         raise Error(
             "objectstore.http: " + method + " " + url + " failed: " + msg
         )
+    return _take_response(lib, res)
 
+
+def _take_response(imm lib: OwnedDLHandle, res: Int) raises -> Response:
+    """Copies a successful result out of the shim and frees it."""
+    var status_fn = lib.get_function[c_long]("os_http_result_status")
+    var body_fn = lib.get_function[Int]("os_http_result_body")
+    var body_len_fn = lib.get_function[c_size_t]("os_http_result_body_len")
+    var hdr_fn = lib.get_function[Int]("os_http_result_headers")
+    var free_fn = lib.get_function[NoneType]("os_http_result_free")
     var status = Int(status_fn(res))
     var raw_headers = _read_cstring(Int(hdr_fn(res)))
     var n = Int(body_len_fn(res))
@@ -545,6 +561,112 @@ def _do_request(
     _ = free_fn(res)
 
     return Response(status, parse_headers(raw_headers), out^)
+
+
+@fieldwise_init
+struct BatchRequest(Copyable, Movable):
+    """One request of a batch: a `GET` or `HEAD`, optionally ranged.
+
+    `expect_len`, when known, sizes the response buffer up front.
+    """
+
+    var method: String
+    var url: String
+    var headers: List[Header]
+    var range_start: Int
+    var range_end: Int
+    var expect_len: Int
+
+    @staticmethod
+    def get(
+        var url: String,
+        var headers: List[Header] = List[Header](),
+        range_start: Int = -1,
+        range_end: Int = -1,
+    ) -> Self:
+        var expect = (
+            range_end - range_start + 1 if range_start >= 0
+            and range_end >= range_start else 0
+        )
+        return Self("GET", url^, headers^, range_start, range_end, expect)
+
+
+def _run_batch(
+    imm lib: OwnedDLHandle,
+    reqs: List[BatchRequest],
+    timeout_ms: Int,
+    verify_tls: Bool,
+    max_parallel: Int,
+) raises -> List[Optional[Response]]:
+    """Every request at once; `None` for one that failed in transport."""
+    var new_fn = lib.get_function[Int]("os_http_batch_new")
+    var add_fn = lib.get_function[c_long]("os_http_batch_add")
+    var run_fn = lib.get_function[c_long]("os_http_batch_run")
+    var take_fn = lib.get_function[Int]("os_http_batch_take")
+    var batch_free_fn = lib.get_function[NoneType]("os_http_batch_free")
+    var rc_fn = lib.get_function[c_long]("os_http_result_rc")
+    var free_fn = lib.get_function[NoneType]("os_http_result_free")
+    var b = new_fn()
+    if b == 0:
+        raise Error("objectstore.http: out of memory allocating a batch")
+    # curl reads these strings when the batch runs, not when it's added:
+    # they live until then.
+    var keep = List[List[UInt8]]()
+    var index = List[Int]()
+    for k in range(len(reqs)):
+        ref r = reqs[k]
+        var m = _cstr(r.method)
+        var u = _cstr(r.url)
+        var h = _cstr(header_blob(r.headers))
+        var i = Int(
+            add_fn(
+                b,
+                Int(m.unsafe_ptr()),
+                Int(u.unsafe_ptr()),
+                Int(h.unsafe_ptr()),
+                c_long_long(r.range_start),
+                c_long_long(r.range_end),
+                c_long_long(r.expect_len),
+                c_long(timeout_ms),
+                c_int(1) if verify_tls else c_int(0),
+            )
+        )
+        index.append(i)
+        keep.append(m^)
+        keep.append(u^)
+        keep.append(h^)
+    _ = run_fn(b, c_long(max_parallel))
+    _ = len(keep)
+    var out = List[Optional[Response]](capacity=len(reqs))
+    for k in range(len(reqs)):
+        if index[k] < 0:
+            out.append(None)
+            continue
+        var res = take_fn(b, c_long(index[k]))
+        if res == 0:
+            out.append(None)
+        elif Int(rc_fn(res)) != 0:
+            _ = free_fn(res)
+            out.append(None)
+        else:
+            out.append(_take_response(lib, res))
+    _ = batch_free_fn(b)
+    return out^
+
+
+def batch_stats() raises -> Tuple[Int, Int]:
+    """`(requests, connections)` for batches since `reset_batch_stats`: the
+    connections stay few while requests climb, because batches reuse them."""
+    var lib = OwnedDLHandle(_find_lib())
+    var req_fn = lib.get_function[c_long]("os_http_batch_requests")
+    var con_fn = lib.get_function[c_long]("os_http_batch_connects")
+    return Tuple(Int(req_fn()), Int(con_fn()))
+
+
+def reset_batch_stats() raises:
+    var lib = OwnedDLHandle(_find_lib())
+    var reset_fn = lib.get_function[NoneType]("os_http_batch_reset_stats")
+    _ = reset_fn()
 
 
 @fieldwise_init
@@ -631,6 +753,65 @@ struct HttpClient(Copyable, Movable):
                     raise e
                 attempt += 1
                 sleep(Float64(backoff_delay_ms(self.retry, attempt)) / 1000.0)
+
+    def request_many(
+        self,
+        reqs: List[BatchRequest],
+        max_parallel: Int = DEFAULT_MAX_PARALLEL,
+    ) raises -> List[Response]:
+        """Every request in `reqs` at once, answers in the same order.
+
+        Like `request`, a status comes back as a `Response` and only a
+        transport failure raises. A request that failed in transport or got
+        a retryable answer is tried again on its own, under `self.retry`.
+        Batches are `GET`s and `HEAD`s, which are always safe to repeat. A
+        shim older than ABI 4 has no batches: then they run one by one.
+        """
+        var out = List[Response](capacity=len(reqs))
+        if len(reqs) == 0:
+            return out^
+        var lib = OwnedDLHandle(_find_lib())
+        var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
+        if Int(abi_fn()) < 4 or len(reqs) == 1:
+            for k in range(len(reqs)):
+                ref r = reqs[k]
+                out.append(
+                    self.request(
+                        r.method,
+                        r.url,
+                        r.headers,
+                        Span[UInt8, ImmUntrackedOrigin](),
+                        r.range_start,
+                        r.range_end,
+                    )
+                )
+            return out^
+        var got = _run_batch(
+            lib, reqs, self.timeout_ms, self.verify_tls, max_parallel
+        )
+        for k in range(len(reqs)):
+            var again = True
+            if got[k]:
+                ref resp = got[k].value()
+                again = self.retry.max_retries > 0 and (
+                    retryable_status(resp.status)
+                    or (not resp.ok() and s3_retryable_error(Span(resp.body)))
+                )
+            if again:
+                ref r = reqs[k]
+                out.append(
+                    self.request(
+                        r.method,
+                        r.url,
+                        r.headers,
+                        Span[UInt8, ImmUntrackedOrigin](),
+                        r.range_start,
+                        r.range_end,
+                    )
+                )
+            else:
+                out.append(got[k].take())
+        return out^
 
     def get(
         self,

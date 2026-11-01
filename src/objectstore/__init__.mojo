@@ -33,6 +33,8 @@ from .fileio import (
 )
 from .gcs import GcsClient, GcsConfig, split_gcs_uri
 from .http import (
+    BatchRequest,
+    DEFAULT_MAX_PARALLEL,
     Header,
     HttpClient,
     Response,
@@ -40,7 +42,9 @@ from .http import (
     curl_version,
     free_connection_pool,
     new_connection_pool,
+    batch_stats,
     pool_stats,
+    reset_batch_stats,
 )
 from .httpio import HttpInputFile, HttpOutputFile
 from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
@@ -50,6 +54,7 @@ from .ranges import (
     CoalescedPlan,
     DEFAULT_COALESCE_GAP,
     RangeReader,
+    assemble,
     plan_ranges,
     read_ranges_coalesced,
 )
