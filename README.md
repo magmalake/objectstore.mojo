@@ -257,10 +257,12 @@ Two things this needed:
   connections along with the library, silently turning reuse back into a
   handshake per request. The shim takes a permanent `dlopen` reference to
   itself the first time it is called.
-* **Threads.** A pool is **not** thread safe, and neither is the process-wide
-  one. Mojo has no threads today, so this costs nothing and is why the share
-  handle installs no locking callbacks; if that changes, each thread needs its
-  own pool and the share handle needs `CURLSHOPT_LOCKFUNC`.
+* **Threads.** Several threads can make requests at once (shim ABI 5): the
+  process-wide pool and a batch's multi handle are per thread, cleaned up
+  when the thread exits, and what threads share — DNS, TLS sessions, open
+  connections — sits behind the share handle's locks, so a short-lived worker
+  thread still reuses connections. A private pool from `new_connection_pool`
+  keeps its connections to itself and belongs to one thread at a time.
 
 The tests assert reuse from both ends rather than inferring it from a
 stopwatch: curl's own connection counter (`pool_stats` → `(requests,
@@ -464,10 +466,8 @@ it: `objectstore` still has exactly one native dependency, and it is libcurl.
   the headers `S3Client._signed_headers` builds, so it wants an
   `S3Client.signer` indirection rather than a new backend.
 * **Parallel or streaming multipart.** Parts go up one at a time from a buffer
-  the caller already holds; there is no upload from a file handle, and no
-  concurrency, because Mojo has no threads.
-* **Concurrent requests.** One connection pool, one request at a time, for the
-  same reason.
+  the caller already holds; there is no upload from a file handle, and parts
+  aren't uploaded concurrently yet.
 * **Server-side encryption headers, ACLs, versioning, object tagging.**
 * **HDFS and other schemes.** `FileIOResolver.backend_for` raises a clear
   error naming the scheme rather than pretending.

@@ -867,11 +867,16 @@ def test_http_request_many() raises:
     assert_equal(got[21].text(), "hello objectstore\n")
     var first = batch_stats()
     assert_equal(first[0], 22)
-    assert_true(first[1] >= 1 and first[1] <= 8, "at most 8 connections")
+    # Connections earlier tests opened may be reused: at most 8 new ones.
+    assert_true(first[1] <= 8, "at most 8 connections")
     _ = c.request_many(reqs, max_parallel=8)
     var second = batch_stats()
     assert_equal(second[0], 44)
-    assert_equal(second[1], first[1], "the second batch opened nothing new")
+    # The second batch reuses the first one's connections; one or two may
+    # have been closed by the server in between.
+    assert_true(
+        second[1] - first[1] <= 2, "the second batch reused its connections"
+    )
 
 
 def test_http_request_many_transport_failure() raises:

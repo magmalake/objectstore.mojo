@@ -21,11 +21,13 @@
  * explicitly keeps the live connections, the DNS cache and the TLS session
  * cache while clearing the options.
  *
- * Thread safety: an os_http_client is NOT thread safe, and neither is the
- * process-wide default client. Mojo has no threads today, and the share handle
- * below deliberately carries no lock callbacks for the same reason; if Mojo
- * ever grows threads, each thread needs its own client and the share handle
- * needs CURLSHOPT_LOCKFUNC.
+ * Thread safety: the "default client" and a batch's multi handle are per
+ * thread (a pthread key, cleaned up when the thread exits), so threads that
+ * each read — an Iceberg scan decoding files on several workers — never share
+ * an easy or multi handle. What they do share goes through the share handle,
+ * which locks: DNS, TLS sessions and the connection cache, so a thread
+ * started for one scan reuses the connections an earlier thread opened. A
+ * client from os_http_client_new still belongs to one thread at a time.
  *
  * Build: shim/pixi.toml (pixi-build-cmake) -> $CONDA_PREFIX/lib/libobjectstoremojo.so
  */
@@ -141,12 +143,22 @@ static int g_inited = 0;
 
 typedef struct {
     CURL *easy;
+    void *share;     /* CURLSH: connections shared, or (private) not */
     long requests;   /* requests performed on this client */
     long connects;   /* connections curl actually had to open */
 } os_http_client;
 
 static CURLSH *g_share = NULL;
-static os_http_client *g_default = NULL;
+static CURLSH *g_share_private = NULL; /* DNS and TLS sessions only */
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_share_locks[CURL_LOCK_DATA_LAST];
+static pthread_key_t g_thread_key;
+
+/* What each thread keeps: its default client and its batches' multi handle. */
+typedef struct {
+    void *client; /* os_http_client */
+    CURLM *multi;
+} os_thread_state;
 
 /*
  * Mojo opens this library through an OwnedDLHandle and closes it when that
@@ -165,26 +177,68 @@ static void pin_self(void) {
 #endif
 }
 
-static void ensure_global(void) {
-    if (g_inited) return;
+static void share_lock(CURL *h, curl_lock_data data, curl_lock_access access,
+                       void *userptr) {
+    (void)h;
+    (void)access;
+    (void)userptr;
+    if (data >= 0 && data < CURL_LOCK_DATA_LAST)
+        pthread_mutex_lock(&g_share_locks[data]);
+}
+
+static void share_unlock(CURL *h, curl_lock_data data, void *userptr) {
+    (void)h;
+    (void)userptr;
+    if (data >= 0 && data < CURL_LOCK_DATA_LAST)
+        pthread_mutex_unlock(&g_share_locks[data]);
+}
+
+static void thread_state_free(void *p);
+
+static void global_init_once(void) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     pin_self();
+    for (int i = 0; i < CURL_LOCK_DATA_LAST; i++)
+        pthread_mutex_init(&g_share_locks[i], NULL);
+    pthread_key_create(&g_thread_key, thread_state_free);
     /*
-     * DNS and TLS sessions are shared across clients: a resolver round trip
-     * and a TLS resumption are worth more than the (single-threaded) locking
-     * they would otherwise need. Connections are deliberately NOT shared —
-     * CURL_LOCK_DATA_CONNECT hands connections between handles, which is only
-     * safe with locking callbacks this build does not install.
+     * Shared across every client and thread, behind the lock callbacks: a
+     * resolver round trip, a TLS resumption and an open connection are each
+     * worth more than a mutex.
      */
     g_share = curl_share_init();
     if (g_share) {
+        curl_share_setopt(g_share, CURLSHOPT_LOCKFUNC, share_lock);
+        curl_share_setopt(g_share, CURLSHOPT_UNLOCKFUNC, share_unlock);
         curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
         curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    }
+    /* A private pool keeps its connections to itself, as promised. */
+    g_share_private = curl_share_init();
+    if (g_share_private) {
+        curl_share_setopt(g_share_private, CURLSHOPT_LOCKFUNC, share_lock);
+        curl_share_setopt(g_share_private, CURLSHOPT_UNLOCKFUNC, share_unlock);
+        curl_share_setopt(g_share_private, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(g_share_private, CURLSHOPT_SHARE,
+                          CURL_LOCK_DATA_SSL_SESSION);
     }
     g_inited = 1;
 }
 
-os_http_client *os_http_client_new(void) {
+static void ensure_global(void) { pthread_once(&g_once, global_init_once); }
+
+static os_thread_state *thread_state(void) {
+    ensure_global();
+    os_thread_state *t = (os_thread_state *)pthread_getspecific(g_thread_key);
+    if (!t) {
+        t = (os_thread_state *)calloc(1, sizeof(os_thread_state));
+        if (t) pthread_setspecific(g_thread_key, t);
+    }
+    return t;
+}
+
+static os_http_client *client_new_with(CURLSH *share) {
     ensure_global();
     os_http_client *c = (os_http_client *)calloc(1, sizeof(os_http_client));
     if (!c) return NULL;
@@ -193,23 +247,45 @@ os_http_client *os_http_client_new(void) {
         free(c);
         return NULL;
     }
-    if (g_share) curl_easy_setopt(c->easy, CURLOPT_SHARE, g_share);
+    c->share = share;
+    if (share) curl_easy_setopt(c->easy, CURLOPT_SHARE, share);
     return c;
 }
 
-void os_http_client_free(os_http_client *c) {
+/* A private pool: its own connections, DNS and TLS sessions shared. */
+os_http_client *os_http_client_new(void) {
+    ensure_global();
+    return client_new_with(g_share_private);
+}
+
+static void client_destroy(os_http_client *c) {
     if (!c) return;
-    if (c == g_default) return; /* the process-wide client outlives callers */
     if (c->easy) curl_easy_cleanup(c->easy);
     free(c);
 }
 
-/* NULL means the process-wide default client. */
+void os_http_client_free(os_http_client *c) {
+    if (!c) return;
+    os_thread_state *t = thread_state();
+    if (t && c == (os_http_client *)t->client) return; /* the default */
+    client_destroy(c);
+}
+
+static void thread_state_free(void *p) {
+    os_thread_state *t = (os_thread_state *)p;
+    if (!t) return;
+    client_destroy((os_http_client *)t->client);
+    if (t->multi) curl_multi_cleanup(t->multi);
+    free(t);
+}
+
+/* NULL means this thread's default client. */
 static os_http_client *client_or_default(os_http_client *c) {
     if (c) return c;
-    ensure_global();
-    if (!g_default) g_default = os_http_client_new();
-    return g_default;
+    os_thread_state *t = thread_state();
+    if (!t) return NULL;
+    if (!t->client) t->client = client_new_with(g_share);
+    return (os_http_client *)t->client;
 }
 
 long os_http_client_requests(os_http_client *c) {
@@ -323,7 +399,7 @@ os_http_result *os_http_request_ex(os_http_client *client,
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, write_cb);
     curl_easy_setopt(h, CURLOPT_HEADERDATA, (void *)&r->headers);
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
-    if (g_share) curl_easy_setopt(h, CURLOPT_SHARE, g_share);
+    if (cl->share) curl_easy_setopt(h, CURLOPT_SHARE, (CURLSH *)cl->share);
     /*
      * Keep the socket alive between requests and keep enough of them cached
      * that alternating hosts — an Iceberg REST catalog and an S3 endpoint, say
@@ -665,18 +741,24 @@ typedef struct {
     size_t cap;
 } os_http_batch;
 
-static CURLM *g_multi = NULL;
-static long g_multi_requests = 0;
+static long g_multi_requests = 0; /* updated atomically */
 static long g_multi_connects = 0;
+
+static CURLM *thread_multi(void) {
+    os_thread_state *t = thread_state();
+    if (!t) return NULL;
+    if (!t->multi) t->multi = curl_multi_init();
+    return t->multi;
+}
 
 os_http_batch *os_http_batch_new(void) {
     ensure_global();
     return (os_http_batch *)calloc(1, sizeof(os_http_batch));
 }
 
-static void batch_item_clear(os_batch_item *it) {
+static void batch_item_clear(os_batch_item *it, CURLM *multi) {
     if (it->easy) {
-        if (g_multi) curl_multi_remove_handle(g_multi, it->easy);
+        if (multi) curl_multi_remove_handle(multi, it->easy);
         curl_easy_cleanup(it->easy);
         it->easy = NULL;
     }
@@ -775,53 +857,65 @@ long os_http_batch_add(os_http_batch *b,
  */
 long os_http_batch_run(os_http_batch *b, long max_parallel) {
     if (!b || b->n == 0) return 0;
-    if (!g_multi) {
-        g_multi = curl_multi_init();
-        if (!g_multi) return (long)CURLM_OUT_OF_MEMORY;
-    }
+    CURLM *multi = thread_multi();
+    if (!multi) return (long)CURLM_OUT_OF_MEMORY;
     if (max_parallel < 1) max_parallel = 1;
-    curl_multi_setopt(g_multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_parallel);
-    curl_multi_setopt(g_multi, CURLMOPT_MAX_HOST_CONNECTIONS, max_parallel);
-    curl_multi_setopt(g_multi, CURLMOPT_MAXCONNECTS, max_parallel + 16);
-    for (size_t i = 0; i < b->n; i++) {
-        os_batch_item *it = b->items[i];
-        it->r->rc = (int)CURLE_FAILED_INIT;
-        if (it->easy) curl_multi_add_handle(g_multi, it->easy);
+    /*
+     * At most `max_parallel` in flight, added as others finish. curl's own
+     * MAX_TOTAL_CONNECTIONS can't do this: the connection cache lives in the
+     * share handle, where the multi's limits don't reach.
+     */
+    size_t next = 0;
+    long in_flight = 0;
+    for (size_t i = 0; i < b->n; i++) b->items[i]->r->rc = (int)CURLE_FAILED_INIT;
+    while (next < b->n && in_flight < max_parallel) {
+        curl_multi_add_handle(multi, b->items[next++]->easy);
+        in_flight++;
     }
-    int running = 1;
     CURLMcode mc = CURLM_OK;
-    while (running) {
-        mc = curl_multi_perform(g_multi, &running);
+    int running = 1;
+    while (in_flight > 0) {
+        mc = curl_multi_perform(multi, &running);
         if (mc != CURLM_OK) break;
-        if (running) mc = curl_multi_poll(g_multi, NULL, 0, 1000, NULL);
-        if (mc != CURLM_OK) break;
-    }
-    CURLMsg *msg;
-    int left;
-    while ((msg = curl_multi_info_read(g_multi, &left))) {
-        if (msg->msg != CURLMSG_DONE) continue;
-        os_batch_item *it = NULL;
-        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&it);
-        if (!it) continue;
-        os_http_result *r = it->r;
-        r->rc = (int)msg->data.result;
-        g_multi_requests += 1;
-        long opened = 0;
-        if (curl_easy_getinfo(it->easy, CURLINFO_NUM_CONNECTS, &opened) ==
-            CURLE_OK)
-            g_multi_connects += opened;
-        if (r->rc != CURLE_OK) {
-            snprintf(r->err, sizeof(r->err), "%s%s%s",
-                     curl_easy_strerror((CURLcode)r->rc),
-                     it->errbuf[0] ? ": " : "", it->errbuf[0] ? it->errbuf : "");
-        } else {
-            curl_easy_getinfo(it->easy, CURLINFO_RESPONSE_CODE, &r->status);
-            if (r->body.oom || r->headers.oom) {
-                r->rc = (int)CURLE_OUT_OF_MEMORY;
-                snprintf(r->err, sizeof(r->err),
-                         "out of memory buffering response");
+        CURLMsg *msg;
+        int left;
+        while ((msg = curl_multi_info_read(multi, &left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+            os_batch_item *it = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&it);
+            curl_multi_remove_handle(multi, msg->easy_handle);
+            in_flight--;
+            if (it) {
+                os_http_result *r = it->r;
+                r->rc = (int)msg->data.result;
+                __atomic_fetch_add(&g_multi_requests, 1, __ATOMIC_RELAXED);
+                long opened = 0;
+                if (curl_easy_getinfo(it->easy, CURLINFO_NUM_CONNECTS,
+                                      &opened) == CURLE_OK)
+                    __atomic_fetch_add(&g_multi_connects, opened,
+                                       __ATOMIC_RELAXED);
+                if (r->rc != CURLE_OK) {
+                    snprintf(r->err, sizeof(r->err), "%s%s%s",
+                             curl_easy_strerror((CURLcode)r->rc),
+                             it->errbuf[0] ? ": " : "",
+                             it->errbuf[0] ? it->errbuf : "");
+                } else {
+                    curl_easy_getinfo(it->easy, CURLINFO_RESPONSE_CODE,
+                                      &r->status);
+                    if (r->body.oom || r->headers.oom) {
+                        r->rc = (int)CURLE_OUT_OF_MEMORY;
+                        snprintf(r->err, sizeof(r->err),
+                                 "out of memory buffering response");
+                    }
+                }
+            }
+            if (next < b->n) {
+                curl_multi_add_handle(multi, b->items[next++]->easy);
+                in_flight++;
             }
         }
+        if (in_flight > 0) mc = curl_multi_poll(multi, NULL, 0, 1000, NULL);
+        if (mc != CURLM_OK) break;
     }
     for (size_t i = 0; i < b->n; i++) {
         os_batch_item *it = b->items[i];
@@ -829,7 +923,7 @@ long os_http_batch_run(os_http_batch *b, long max_parallel) {
             snprintf(it->r->err, sizeof(it->r->err), "request did not run%s%s",
                      mc != CURLM_OK ? ": " : "",
                      mc != CURLM_OK ? curl_multi_strerror(mc) : "");
-        batch_item_clear(it);
+        batch_item_clear(it, multi);
     }
     return mc == CURLM_OK ? 0 : (long)mc;
 }
@@ -846,7 +940,7 @@ os_http_result *os_http_batch_take(os_http_batch *b, long i) {
 void os_http_batch_free(os_http_batch *b) {
     if (!b) return;
     for (size_t i = 0; i < b->n; i++) {
-        batch_item_clear(b->items[i]);
+        batch_item_clear(b->items[i], thread_multi());
         if (b->items[i]->r) os_http_result_free(b->items[i]->r);
         free(b->items[i]);
     }
@@ -856,15 +950,20 @@ void os_http_batch_free(os_http_batch *b) {
 
 /* Requests batches have run, and connections they had to open: reuse across
    batches keeps the second near zero. */
-long os_http_batch_requests(void) { return g_multi_requests; }
-long os_http_batch_connects(void) { return g_multi_connects; }
+long os_http_batch_requests(void) {
+    return __atomic_load_n(&g_multi_requests, __ATOMIC_RELAXED);
+}
+long os_http_batch_connects(void) {
+    return __atomic_load_n(&g_multi_connects, __ATOMIC_RELAXED);
+}
 void os_http_batch_reset_stats(void) {
-    g_multi_requests = 0;
-    g_multi_connects = 0;
+    __atomic_store_n(&g_multi_requests, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_multi_connects, 0, __ATOMIC_RELAXED);
 }
 
 /*
  * 1 = 0.1.x (one easy handle per request); 2 = pooled clients;
- * 3 = os_imds_credentials; 4 = batches (os_http_batch_*).
+ * 3 = os_imds_credentials; 4 = batches (os_http_batch_*); 5 = safe to use
+ * from several threads (a default client and multi handle per thread).
  */
-long os_http_shim_abi(void) { return 4; }
+long os_http_shim_abi(void) { return 5; }
