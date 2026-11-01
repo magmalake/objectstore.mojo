@@ -25,10 +25,10 @@ session instead of shaking hands again — the difference between ~2.9 ms and
 default; `new_connection_pool` hands out a private one for a caller that wants
 its connections kept apart.
 
-**Threads.** An `HttpClient` — and the pool behind it — is single-threaded.
-Mojo has no threads today, so this costs nothing and is why the shim's share
-handle installs no locking callbacks; if that changes, each thread needs its
-own pool.
+**Threads.** Requests can be made from several threads at once (shim ABI
+5): `SHARED_POOL` and a batch's multi handle are per thread in the shim, and
+what threads share — DNS, TLS sessions, open connections — sits behind locks.
+A private pool from `new_connection_pool` belongs to one thread at a time.
 
 **Batches.** `request_many` sends several requests at once and returns when
 all have answered: one thread, curl's multi interface underneath, its own
@@ -159,7 +159,8 @@ def reset_pool_stats(pool: Int = SHARED_POOL) raises:
 
 def shim_abi() raises -> Int:
     """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections;
-    3 = `instance_credentials_blob`; 4 = batches (`request_many`)."""
+    3 = `instance_credentials_blob`; 4 = batches (`request_many`); 5 = safe
+    from several threads."""
     var lib = OwnedDLHandle(_find_lib())
     var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
     return Int(abi_fn())
@@ -676,8 +677,8 @@ struct HttpClient(Copyable, Movable):
     The client itself holds no socket: `pool` names a curl handle living in
     the shim, and `SHARED_POOL` — the default — is the process-wide one. Two
     `HttpClient` values therefore share connections, which is what makes an
-    Iceberg scan that opens a new `S3Client` per file cheap. Single-threaded,
-    like everything else in Mojo today.
+    Iceberg scan that opens a new `S3Client` per file cheap. With the default
+    pool, threads may each make requests at once.
 
     Redirects are **off** by default: a presigned S3 URL carries its signature
     in the query string and must never be silently re-issued elsewhere.

@@ -33,6 +33,7 @@ from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
 from .path import Uri, parse_uri
 from .ranges import (
     ByteRange,
+    CoalescedPlan,
     DEFAULT_COALESCE_GAP,
     RangeReader,
     assemble,
@@ -648,6 +649,64 @@ struct FileIOResolver(Copyable, Movable):
             var got = client.value().get_many(reqs, what)
             for i in range(len(s3_at)):
                 swap(out[s3_at[i]], got[i])
+        return out^
+
+    def read_ranges_many(
+        self, locations: List[String], ranges: List[List[ByteRange]]
+    ) raises -> List[List[List[UInt8]]]:
+        """`ranges[i]` of `locations[i]`, for every `i`, in order.
+
+        Each file's ranges are coalesced as `read_ranges` does, and then every
+        group of every file on S3 is fetched in one batch: reading several
+        files' footers, or several files' column chunks, costs one round of
+        requests rather than one per file. Other backends read file by file.
+        """
+        if len(ranges) != len(locations):
+            raise Error(
+                "objectstore: read_ranges_many needs one range list per"
+                " location"
+            )
+        var out = List[List[List[UInt8]]](capacity=len(locations))
+        var inputs = List[AnyInputFile]()
+        var plans = List[CoalescedPlan]()
+        var on_s3 = List[Int]()
+        var reqs = List[BatchRequest]()
+        var what = List[String]()
+        var first = List[Int]()
+        """For each file on S3, where its groups start in `reqs`."""
+        var client = Optional[S3Client](None)
+        for k in range(len(locations)):
+            out.append(List[List[UInt8]]())
+            var f = self.new_input(locations[k])
+            if f.backend != BACKEND_S3:
+                out[k] = f.read_ranges(ranges[k])
+                continue
+            var plan = plan_ranges(ranges[k])
+            first.append(len(reqs))
+            for ref g in plan.fetches:
+                reqs.append(
+                    f._s3.signed_get(
+                        f._bucket, f._key, g.offset, g.offset + g.length - 1
+                    )
+                )
+                what.append(f.uri + " bytes " + String(g.offset))
+            if not client:
+                client = f._s3.copy()
+            on_s3.append(k)
+            plans.append(plan^)
+            inputs.append(f^)
+        if len(reqs) == 0:
+            return out^
+        var got = client.value().get_many(reqs, what)
+        for i in range(len(on_s3)):
+            var bufs = List[List[UInt8]](capacity=len(plans[i].fetches))
+            for j in range(len(plans[i].fetches)):
+                var b = List[UInt8]()
+                swap(b, got[first[i] + j])
+                bufs.append(b^)
+            out[on_s3[i]] = assemble(
+                inputs[i], plans[i], ranges[on_s3[i]], bufs^
+            )
         return out^
 
     def read_text(self, location: String) raises -> String:
