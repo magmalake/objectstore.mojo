@@ -6,8 +6,9 @@ to resolve from conda ("No candidates were found") on both the stable and the
 nightly toolchain, and an object store without HTTPS is not an object store.
 conda-forge's `libcurl` ships TLS and a CA bundle for every platform we target,
 so this tin follows the magmalake FFI recipe (zstd.mojo, lz4.mojo): a tiny C
-shim built as a `pixi-build-cmake` package into `$CONDA_PREFIX/lib`, dlopened
-through an `OwnedDLHandle`.
+shim built as a `pixi-build-cmake` package into `$CONDA_PREFIX/lib`, found by
+`_dlopen.open_library` (with or without `CONDA_PREFIX`) and dlopened once per
+process through an `OwnedDLHandle`.
 
 The shim exists because `curl_easy_setopt` is a C variadic, which a dlopened
 symbol cannot express; `shim/curl_wrapper.c` collapses a whole request into one
@@ -42,8 +43,9 @@ backoff and jitter, but only for requests that can safely be repeated — see
 caller's back on a method the server might have already acted on.
 """
 
-from std.ffi import OwnedDLHandle, c_int, c_long, c_long_long, c_size_t
-from std.os import getenv
+from std.ffi import _Global, OwnedDLHandle, c_int, c_long, c_long_long, c_size_t
+
+from ._dlopen import open_library
 from std.time import monotonic, sleep
 
 
@@ -58,16 +60,50 @@ comptime DEFAULT_TIMEOUT_MS = 30000
 object over a slow link is not, so this is generous rather than tight."""
 
 
-def _find_lib() -> String:
-    """Path to libobjectstoremojo.so: `$CONDA_PREFIX/lib` (installed by the
-    objectstore-shim pixi package), else `build/` for a bare checkout."""
-    var prefix = getenv("CONDA_PREFIX", "")
-    if prefix == "":
-        return String("build/libobjectstoremojo.so")
-    var out = String("")
-    out += prefix
-    out += "/lib/libobjectstoremojo.so"
-    return out^
+struct _Shim(Movable):
+    """The process-wide shim handle, or why it couldn't be opened."""
+
+    var handle: Optional[OwnedDLHandle]
+    var error: String
+
+    def __init__(out self):
+        try:
+            self.handle = open_library(
+                "objectstore.mojo", "libobjectstoremojo.so"
+            )
+            self.error = String("")
+        except e:
+            self.handle = None
+            self.error = String(e)
+
+
+def _open_lib() -> _Shim:
+    """`dlopen` the shim, once, for the life of the process. A failure is
+    kept and raised by `_lib()` on every use, never an abort."""
+    return _Shim()
+
+
+comptime _LIB = _Global["objectstore_mojo_shim", _open_lib]
+"""The shim handle, opened on first use and never closed.
+
+Every call used to `dlopen` and `dlclose` the shim; one handle for the
+process also runs the library search (`_dlopen.open_library`, which works
+with or without `CONDA_PREFIX`) once. `_Global` initialises exactly once
+even under concurrent first use, so the handle is safe to reach from
+worker threads.
+"""
+
+
+def _lib() raises -> ref[MutUntrackedOrigin] OwnedDLHandle:
+    """The cached handle, borrowed. Never destroy the referent.
+
+    Raises:
+        Error: If the shim can't be found (see `_dlopen.open_library`).
+    """
+    ref shim = _LIB.get_or_create_ptr()[]
+    if not shim.handle:
+        raise Error(shim.error)
+    return shim.handle.unsafe_value()
 
 
 def _cstr(s: String) -> List[UInt8]:
@@ -110,7 +146,7 @@ def new_connection_pool() raises -> Int:
     because `HttpClient` is `Copyable`, and a copyable owner of a C resource
     is a double free waiting to happen. Most callers want `SHARED_POOL`.
     """
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     return _pool_new(lib)
 
 
@@ -126,7 +162,7 @@ def free_connection_pool(pool: Int) raises:
     """Closes a pool from `new_connection_pool` and its live connections."""
     if pool == SHARED_POOL:
         return
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     _pool_free(lib, pool)
 
 
@@ -142,7 +178,7 @@ def pool_stats(pool: Int = SHARED_POOL) raises -> Tuple[Int, Int]:
     that it stays at 1 while `requests` climbs — which is how the tests prove
     it rather than inferring it from a stopwatch.
     """
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     return _pool_stats(lib, pool)
 
 
@@ -153,7 +189,7 @@ def _pool_stats(imm lib: OwnedDLHandle, pool: Int) raises -> Tuple[Int, Int]:
 
 
 def reset_pool_stats(pool: Int = SHARED_POOL) raises:
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     var reset_fn = lib.get_function[NoneType]("os_http_client_reset_stats")
     _ = reset_fn(pool)
 
@@ -162,7 +198,7 @@ def shim_abi() raises -> Int:
     """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections;
     3 = `instance_credentials_blob`; 4 = batches (`request_many`); 5 = safe
     from several threads."""
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
     return Int(abi_fn())
 
@@ -176,7 +212,7 @@ def instance_credentials_blob() raises -> String:
     cheap to call per request. A shim older than ABI 3 has no lookup and
     answers `""` as well.
     """
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     return _instance_credentials(lib)
 
 
@@ -659,14 +695,14 @@ def _run_batch(
 def batch_stats() raises -> Tuple[Int, Int]:
     """`(requests, connections)` for batches since `reset_batch_stats`: the
     connections stay few while requests climb, because batches reuse them."""
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     var req_fn = lib.get_function[c_long]("os_http_batch_requests")
     var con_fn = lib.get_function[c_long]("os_http_batch_connects")
     return Tuple(Int(req_fn()), Int(con_fn()))
 
 
 def reset_batch_stats() raises:
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     var reset_fn = lib.get_function[NoneType]("os_http_batch_reset_stats")
     _ = reset_fn()
 
@@ -723,7 +759,7 @@ struct HttpClient(Copyable, Movable):
         var attempt = 0
         while True:
             try:
-                var lib = OwnedDLHandle(_find_lib())
+                ref lib = _lib()
                 var resp = _do_request(
                     lib,
                     self.pool,
@@ -772,7 +808,7 @@ struct HttpClient(Copyable, Movable):
         var out = List[Response](capacity=len(reqs))
         if len(reqs) == 0:
             return out^
-        var lib = OwnedDLHandle(_find_lib())
+        ref lib = _lib()
         var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
         if Int(abi_fn()) < 4 or len(reqs) == 1:
             for k in range(len(reqs)):
@@ -860,7 +896,7 @@ struct HttpClient(Copyable, Movable):
 
 def curl_version() raises -> String:
     """Libcurl's own version banner, e.g. `libcurl/8.9.1 OpenSSL/3.3.1 …`."""
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     return _do_curl_version(lib)
 
 
