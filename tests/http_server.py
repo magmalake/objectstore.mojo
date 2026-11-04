@@ -9,6 +9,11 @@ and prints the URL on stdout so the test runner can capture it.
 Routes:
   /files/<name>   GET/HEAD (Range aware), PUT (201/204), DELETE (204/404)
   /echo           any method; body reports method, a chosen header, body length
+  /headers/...    any method; body is the method, then every request header
+                  exactly as received ("name: value", lowercased names, in
+                  arrival order) — what the transport added, not just what the
+                  caller asked for. The last such request is kept, and
+                  GET /headers-last answers it again.
   /status/<code>  answers with that status and a short body
   /slow?ms=N      sleeps N milliseconds first (timeout tests)
   /noclen         a chunked response, so Content-Length is absent
@@ -34,6 +39,8 @@ SEEN_PORTS = set()
 # Per-key attempt counters for /flaky.
 ATTEMPTS = {}
 STATE_LOCK = threading.Lock()
+# The last /headers/ request's report, for GET /headers-last.
+LAST_HEADERS = [b""]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -148,6 +155,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"5\r\nchunk\r\n0\r\n\r\n")
             return
 
+        if path == "/headers-last":
+            with STATE_LOCK:
+                out = LAST_HEADERS[0]
+            return self._send(200, out, "text/plain")
+
+        if path.startswith("/headers/"):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+            lines = ["method=%s" % self.command, "body-len=%d" % len(body)]
+            for name, value in self.headers.items():
+                lines.append("%s: %s" % (name.lower(), value))
+            out = ("\n".join(lines) + "\n").encode("utf-8")
+            with STATE_LOCK:
+                LAST_HEADERS[0] = out
+            return self._send(200, out, "text/plain")
+
         if path == "/echo":
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n) if n else b""
@@ -208,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._send(404, b"no route")
 
-    do_GET = do_HEAD = do_PUT = do_POST = do_DELETE = _serve
+    do_GET = do_HEAD = do_PUT = do_POST = do_PATCH = do_DELETE = _serve
 
 
 def main():

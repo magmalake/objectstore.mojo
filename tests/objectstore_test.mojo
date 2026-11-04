@@ -639,6 +639,66 @@ def test_http_verbs_and_custom_headers() raises:
     assert_equal(c.delete(base + "/files/created.txt").status, 404)
 
 
+def _received_headers(report: String) -> Dict[String, String]:
+    """The `name: value` lines of a `/headers/` report, by lowercased name."""
+    var out = Dict[String, String]()
+    for line in report.split("\n"):
+        var l = String(line)
+        var colon = l.find(": ")
+        if colon <= 0:
+            continue
+        out[String(l[byte=0:colon])] = String(l[byte = colon + 2 :])
+    return out^
+
+
+def test_http_body_requests_add_no_content_type() raises:
+    """A body must not acquire a Content-Type the caller did not send.
+
+    The shim hands bodies to curl as POSTFIELDS, which on its own makes curl
+    add `Content-Type: application/x-www-form-urlencoded`. Real S3 then parses
+    a POST body as form fields and folds them into the canonical query it
+    checks SigV4 against: every CompleteMultipartUpload failed with 403
+    SignatureDoesNotMatch, while MinIO, which does not do that, passed.
+    """
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_http_body_requests_add_no_content_type: no server")
+        return
+    var c = HttpClient()
+    var body = _bytes(String("<Doc>x</Doc>"))
+    var none = List[Header]()
+    for method in ["POST", "PUT", "PATCH"]:
+        var m = String(method)
+        var r = c.request(m, base + "/headers/x", none, Span(body))
+        assert_equal(r.status, 200)
+        assert_true(r.text().find("method=" + m) >= 0)
+        assert_true(r.text().find("body-len=12") >= 0)
+        var got = _received_headers(r.text())
+        assert_true(
+            "content-type" not in got,
+            m + " with a body sent an unrequested " + r.text(),
+        )
+        # An empty body goes through the same POSTFIELDS path.
+        var empty = c.request(
+            m, base + "/headers/x", none, Span[UInt8, ImmUntrackedOrigin]()
+        )
+        assert_true("content-type" not in _received_headers(empty.text()))
+
+    # A Content-Type the caller does send arrives once, unchanged.
+    var hs = List[Header]()
+    hs.append(Header("Content-Type", "application/xml"))
+    var r = c.post(base + "/headers/x", Span(body), hs)
+    var got = _received_headers(r.text())
+    assert_equal(got["content-type"], "application/xml")
+    assert_equal(r.text().count("content-type:"), 1)
+    # Lowercase spelling is still the caller's header, not a missing one.
+    var lower = List[Header]()
+    lower.append(Header("content-type", "text/plain"))
+    var r2 = c.put(base + "/headers/x", Span(body), lower)
+    assert_equal(_received_headers(r2.text())["content-type"], "text/plain")
+    assert_equal(r2.text().count("content-type:"), 1)
+
+
 def test_http_timeout() raises:
     var base = _http_base()
     if base == "":
@@ -1537,6 +1597,90 @@ def _s3_bucket() -> String:
 
 def _s3_client() raises -> S3Client:
     return S3Client(S3Config.from_env())
+
+
+def _assert_only_signed_headers(report: String, what: String) raises:
+    """Every header the server received is either in the request's signed set
+    or one SigV4 lets travel unsigned and the shim always adds."""
+    var got = _received_headers(report)
+    assert_true("authorization" in got, what + ": unsigned")
+    var auth = got["authorization"]
+    var at = auth.find("SignedHeaders=")
+    assert_true(at >= 0, what + ": " + auth)
+    var tail = String(auth[byte = at + 14 :])
+    var comma = tail.find(",")
+    var names = String(tail[byte=0:comma]) if comma >= 0 else tail
+    var signed = Dict[String, Bool]()
+    for name in names.split(";"):
+        signed[String(name)] = True
+    for entry in got.items():
+        var name = entry.key
+        if name in signed:
+            continue
+        assert_true(
+            name == "authorization"
+            or name == "content-length"
+            or name == "user-agent"
+            or name == "accept",
+            what + " sent unsigned header '" + name + "': " + report,
+        )
+
+
+def test_s3_sends_only_signed_headers() raises:
+    """What the shim puts on the wire for each S3 write, checked against what
+    was signed — against a local echo server, so it runs without AWS.
+
+    MinIO accepts extra unsigned headers and does not read a POST body as a
+    form, so it never noticed curl's default form Content-Type; real S3 did,
+    and rejected every CompleteMultipartUpload. This is the check that would
+    have caught it.
+    """
+    var base = _http_base()
+    if base == "":
+        print("SKIP test_s3_sends_only_signed_headers: no server")
+        return
+    var creds = S3Credentials("AKIDEXAMPLE", "secret", "token")
+    var c = S3Client(S3Config(base, "us-east-2", True, creds^))
+    var bucket = String("headers")
+    var body = _bytes(String("<CompleteMultipartUpload/>"))
+
+    # CompleteMultipartUpload itself: a POST with an XML body.
+    var etags = List[String]()
+    etags.append(String('"etag-1"'))
+    c.complete_multipart_upload(bucket, String("k.parquet"), "up-1", etags)
+    var last = HttpClient().get(base + "/headers-last").text()
+    assert_true(last.find("method=POST") >= 0, last)
+    _assert_only_signed_headers(last, "CompleteMultipartUpload")
+    # Typed by the client itself, so an older shim that still adds curl's
+    # form default cannot reintroduce the bug.
+    var sent = _received_headers(last)
+    assert_true("content-type" in sent, "untyped Complete body: " + last)
+    assert_equal(sent["content-type"], "application/xml")
+
+    # The generic paths: POST and PUT with a body, with and without a
+    # caller Content-Type, and the body-less POST of CreateMultipartUpload.
+    var params = List[QueryParam]()
+    params.append(QueryParam("uploadId", "up-1"))
+    var none = List[Header]()
+    var typed = List[Header]()
+    typed.append(Header("Content-Type", "application/octet-stream"))
+    for method in ["POST", "PUT"]:
+        var m = String(method)
+        var r = c.request(m, bucket, String("k"), params, Span(body), none)
+        _assert_only_signed_headers(r.text(), m + " with body")
+        r = c.request(m, bucket, String("k"), params, Span(body), typed)
+        _assert_only_signed_headers(r.text(), m + " with typed body")
+    var create = List[QueryParam]()
+    create.append(QueryParam("uploads", ""))
+    var r = c.request(
+        "POST",
+        bucket,
+        String("k"),
+        create,
+        Span[UInt8, ImmUntrackedOrigin](),
+        none,
+    )
+    _assert_only_signed_headers(r.text(), "CreateMultipartUpload")
 
 
 def test_s3_unsigned_payload() raises:

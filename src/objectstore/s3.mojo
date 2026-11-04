@@ -816,7 +816,14 @@ struct S3Client(Copyable, Movable):
 
         var params = List[QueryParam]()
         params.append(QueryParam("uploadId", upload_id))
-        var r = self.request("POST", bucket, key, params, doc.as_bytes())
+        # Said explicitly, not left to the transport: a POST body without a
+        # Content-Type went out as curl's default form encoding, which real S3
+        # parses into the canonical query string — 403 SignatureDoesNotMatch.
+        # The shim now sends no default, but this keeps the request correct
+        # against an older installed shim too.
+        var extra = List[Header]()
+        extra.append(Header("Content-Type", "application/xml"))
+        var r = self.request("POST", bucket, key, params, doc.as_bytes(), extra)
         if not r.ok():
             raise Error(
                 "s3: CompleteMultipartUpload "
