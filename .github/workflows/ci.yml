@@ -32,11 +32,13 @@ jobs:
       - name: Unit tests and CLI build
         run: pixi run -e ${{ matrix.env }} check
 
-      # Through `pixi run`, because the binary dlopens the shim from
-      # $CONDA_PREFIX/lib and that variable only exists inside the environment.
+      # Through `pixi run`, with $CONDA_PREFIX set, and then from the plain
+      # shell, where the shim is found through the binary's rpath.
       - name: CLI smoke
         run: |
           pixi run -e ${{ matrix.env }} ./build/objectstore-mojo version
           pixi run -e ${{ matrix.env }} ./build/objectstore-mojo stat file://$PWD/LICENSE
           pixi run -e ${{ matrix.env }} ./build/objectstore-mojo head file://$PWD/NOTICE 40
           pixi run -e ${{ matrix.env }} ./build/objectstore-mojo ls file://$PWD/shim
+          env -u CONDA_PREFIX ./build/objectstore-mojo version
+          env -u CONDA_PREFIX ./build/objectstore-mojo stat file://$PWD/LICENSE

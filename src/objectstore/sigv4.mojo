@@ -14,7 +14,7 @@ URL can be handed to something that knows nothing about AWS.
 from std.ffi import OwnedDLHandle, c_long_long
 
 from .crypto import hmac_sha256, sha256_hex, to_hex
-from .http import Header, _ascii_lower, _find_lib, _trim
+from .http import Header, _ascii_lower, _lib, _trim
 from .path import url_encode
 
 
@@ -45,7 +45,7 @@ def epoch_now() raises -> Int:
     Mojo's `std.time` offers only a monotonic clock, and SigV4 needs a real
     UTC timestamp — AWS rejects requests more than 15 minutes out of skew.
     """
-    var lib = OwnedDLHandle(_find_lib())
+    ref lib = _lib()
     return _do_epoch_now(lib)
 
 

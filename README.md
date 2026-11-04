@@ -55,7 +55,13 @@ presigned URL is nothing but HTTPS. So this tin supplies the transport.
 
 It does it the way every other magmalake FFI tin binds a C library (zstd.mojo,
 lz4.mojo): **a tiny C shim built as a `pixi-build-cmake` package into
-`$CONDA_PREFIX/lib`, dlopened through an `OwnedDLHandle`.** conda-forge's
+`$CONDA_PREFIX/lib`, dlopened once per process through an `OwnedDLHandle`.**
+The shim is found with or without `CONDA_PREFIX` (`src/objectstore/_dlopen.mojo`:
+`$CONDA_PREFIX/lib`, then next to the executable and in its `../lib`, then
+the binary's rpath, which `mojo build` points at the environment it built
+in), so a binary built with `pixi run mojo build` also runs from a plain
+shell; when none has it, the call raises an Error saying to set
+`CONDA_PREFIX`. conda-forge's
 `libcurl` brings TLS and a CA bundle on every platform we target, and
 `pixi-build-cmake` is already proven to find a C compiler on both the ubuntu
 and macos runners.
