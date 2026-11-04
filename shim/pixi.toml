@@ -1,6 +1,6 @@
 [package]
 name = "objectstore-shim"
-version = "0.2.0"
+version = "0.2.1"
 description = "C FFI shim for objectstore-mojo: libobjectstoremojo.so over libcurl, dlopened at runtime. ABI 2: pooled connections, additive over ABI 1."
 
 [package.build]

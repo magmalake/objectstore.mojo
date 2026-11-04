@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 - 2026-11-04
+
+The shim is objectstore-shim 0.2.1, so a project that mixes packages pinning
+0.4.1 and 0.4.2 sees two versions of it, not two records of one.
 
 - Multipart uploads complete on real AWS S3. `CompleteMultipartUpload` was
   answered `403 SignatureDoesNotMatch` every time, after create and every
