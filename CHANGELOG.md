@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Multipart uploads complete on real AWS S3. `CompleteMultipartUpload` was
+  answered `403 SignatureDoesNotMatch` every time, after create and every
+  part had succeeded. The shim sends bodies as `CURLOPT_POSTFIELDS`, and curl
+  then adds `Content-Type: application/x-www-form-urlencoded` to any request
+  that doesn't set one. S3 parses a form-encoded POST body as query
+  parameters and puts them in the canonical request it checks the signature
+  against, so the XML part list became a query parameter the client never
+  signed. MinIO doesn't do this, which is why CI passed. Two fixes: the shim
+  no longer sends a Content-Type the caller didn't give (POST, PUT, PATCH,
+  with or without a body), and `complete_multipart_upload` sends
+  `Content-Type: application/xml` itself, signed, so it also works with an
+  older installed shim.
+- Objects written without a content type no longer get
+  `application/x-www-form-urlencoded` as their stored Content-Type, which the
+  same curl default did to every `put_object` and `CreateMultipartUpload`
+  (and to Azure/GCS PUTs through `HttpOutputFile`). S3 now stores its own
+  default, `binary/octet-stream`.
+- Tests: the local HTTP test server has a `/headers/` route that echoes every
+  request header as received, and new tests assert that body requests carry
+  no unrequested Content-Type and that every header an S3 write puts on the
+  wire was signed (or is one SigV4 lets travel unsigned).
+
 ## 0.4.1 - 2026-11-03
 
 - The shim is found without `CONDA_PREFIX`: after `$CONDA_PREFIX/lib`,

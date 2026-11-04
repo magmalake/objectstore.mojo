@@ -346,6 +346,21 @@ static struct curl_slist *build_headers(const char *blob) {
 }
 
 /*
+ * Whether the blob names header `name` (ASCII case-insensitive, at the start
+ * of a line, followed by ':').
+ */
+static int blob_has_header(const char *blob, const char *name) {
+    size_t n = strlen(name);
+    const char *p = blob;
+    while (p && *p) {
+        if (strncasecmp(p, name, n) == 0 && p[n] == ':') return 1;
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    return 0;
+}
+
+/*
  * One HTTP request on `client` (NULL = the process-wide client). `method` is
  * GET/PUT/POST/DELETE/HEAD (anything else is sent verbatim as a custom
  * method). `range_start`/`range_end` < 0 mean "no Range header"; a negative
@@ -442,12 +457,15 @@ os_http_result *os_http_request_ex(os_http_client *client,
      * verb (PUT/POST/…) intact. CURLOPT_UPLOAD would need a read callback and
      * would add an unwanted `Expect: 100-continue`.
      */
+    int used_postfields = 1;
     if (body && body_len > 0 && !is_head) {
         curl_easy_setopt(h, CURLOPT_POSTFIELDS, body);
         curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body_len);
     } else if (method && (strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0)) {
         curl_easy_setopt(h, CURLOPT_POSTFIELDS, "");
         curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)0);
+    } else {
+        used_postfields = 0;
     }
 
     char range[64];
@@ -466,6 +484,18 @@ os_http_result *os_http_request_ex(os_http_client *client,
      * asked for it explicitly (an empty-valued header removes curl's own).
      */
     hdrs = curl_slist_append(hdrs, "Expect:");
+    /*
+     * POSTFIELDS also makes curl add `Content-Type:
+     * application/x-www-form-urlencoded` to any request that does not set
+     * one, PUT included. Nothing here sends a form, and on S3 that header is
+     * not harmless: S3 then parses a POST body as form fields and folds them
+     * into the canonical query string it verifies SigV4 against, so
+     * CompleteMultipartUpload failed with 403 SignatureDoesNotMatch (MinIO
+     * does not do this, which is why CI never saw it). On a PUT it was stored
+     * as the object's Content-Type. With no caller Content-Type, send none.
+     */
+    if (used_postfields && !blob_has_header(headers_blob, "Content-Type"))
+        hdrs = curl_slist_append(hdrs, "Content-Type:");
     if (hdrs) curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
 
     CURLcode rc = curl_easy_perform(h);
