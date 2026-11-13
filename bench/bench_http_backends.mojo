@@ -11,8 +11,16 @@ Modes (SIZE and COUNT in the environment, sizes in bytes):
     setup    PUT a SIZE-byte object to S3 (BUCKET, KEY; S3Config.from_env)
              and print a presigned GET URL for it, valid for a day
 
-Prints one line: mode, backend, requests, bytes, seconds, MB/s. CPU time is
-measured from outside (bench/run_backend_bench.sh).
+Prints one line: mode, backend, requests, bytes, seconds, MB/s; measure CPU
+time from outside (e.g. getrusage of the child). Build, after
+tools/fetch_requests.sh, with threads.mojo checked out next to this repo:
+
+    mojo build bench/bench_http_backends.mojo -I src \
+        -I .deps/requests -I .deps/tls -I .deps/tcp -I .deps/url -I .deps/json \
+        -I ../threads.mojo/src -I ../threads.mojo/compat -o build/bench-http-backends
+
+Over HTTPS the requests backend trusts $SSL_CERT_FILE (a self-signed MinIO's
+CA appended to the system bundle, say); libcurl trusts its own bundle.
 """
 
 from std.os import getenv
@@ -33,7 +41,12 @@ struct Job(Movable):
     var errors: List[String]
 
     def __init__(
-        out self, url: String, size: Int, per_thread: Int, object_len: Int, threads: Int
+        out self,
+        url: String,
+        size: Int,
+        per_thread: Int,
+        object_len: Int,
+        threads: Int,
     ):
         self.url = url
         self.size = size
@@ -91,7 +104,9 @@ def main() raises:
     var cr = probe.header("Content-Range")
     var slash = cr.find("/")
     if probe.status != 206 or slash < 0:
-        raise Error("no Content-Range from " + url + ": " + String(probe.status))
+        raise Error(
+            "no Content-Range from " + url + ": " + String(probe.status)
+        )
     var object_len = atol(String(cr[byte = slash + 1 :]))
     var total = 0
     var n = 0
@@ -118,7 +133,9 @@ def main() raises:
             var reqs = List[BatchRequest]()
             for j in range(k, min(count, k + 16)):
                 var at = _offset(j, size, object_len)
-                reqs.append(BatchRequest.get(url, List[Header](), at, at + size - 1))
+                reqs.append(
+                    BatchRequest.get(url, List[Header](), at, at + size - 1)
+                )
             var got = c.request_many(reqs, max_parallel=16)
             for g in range(len(got)):
                 if got[g].status != 206 or len(got[g].body) != size:

@@ -31,7 +31,7 @@ from std.atomic import Atomic
 from std.collections import Dict
 from std.ffi import _Global
 from std.os import getenv
-from std.memory import OwnedPointer, UnsafePointer
+from std.memory import OwnedPointer
 
 from http_client import HttpClient as RClient, HttpHeaders, HttpResponse
 from http_client import _unix_time_secs
@@ -71,7 +71,7 @@ struct _Client(Movable):
         self.timeout_secs = timeout_secs
 
     def address(self) -> Int:
-        return Int(UnsafePointer(to=self.owned[]))
+        return Int(Pointer(to=self.owned[]))
 
 
 def _at(address: Int) -> Pointer[RClient, MutUntrackedOrigin]:
