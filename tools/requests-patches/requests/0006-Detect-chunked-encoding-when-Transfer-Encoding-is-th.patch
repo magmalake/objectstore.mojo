@@ -1,0 +1,90 @@
+From 5189f3da54943c794239096759c812027609e927 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:36:06 -0800
+Subject: [PATCH 06/10] Detect chunked encoding when Transfer-Encoding is the
+ last header
+
+_buf_has_chunked searched the value up to header_end - 1, one byte
+short when Transfer-Encoding is the last header line, so "chunked" was
+never found there. The response was then read until the server closed
+the connection: S3 puts Transfer-Encoding last, and a ListObjectsV2
+answer took 7 s over HTTPS (23 s over HTTP) instead of under one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo |  4 +++-
+ test_client.mojo | 11 +++++++++++
+ test_server.py   | 12 ++++++++++++
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index d3eb747..e8070ae 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -2310,8 +2310,10 @@ def _buf_has_chunked(buf: List[UInt8], header_end: Int) -> Bool:
+             var pos = i + 18
+             while pos < header_end and buf[pos] == 32:
+                 pos += 1
++            # The value runs to the line's CRLF; on the last header line
++            # that is the CRLF at header_end itself.
+             var line_end = pos
+-            while line_end < header_end - 1:
++            while line_end < header_end:
+                 if buf[line_end] == 13 and buf[line_end + 1] == 10:
+                     break
+                 line_end += 1
+diff --git a/test_client.mojo b/test_client.mojo
+index c1d5be5..f559d0f 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1342,6 +1342,16 @@ def test_connections_opened_counts_connects() raises:
+     assert_eq(client.connections_opened, 3, "one per closed connection")
+ 
+ 
++def test_chunked_when_transfer_encoding_is_the_last_header() raises:
++    """A chunked body ends at its last chunk even when Transfer-Encoding is
++    the last header line and the server keeps the connection open."""
++    var client = HttpClient(allow_private_ips=True, timeout_secs=10)
++    var t0 = _unix_time_secs()
++    var resp = client.get(BASE + "/chunked-te-last")
++    assert_str_eq(resp.body, "hello world", "decoded body")
++    assert_true(_unix_time_secs() - t0 < 3, "did not wait for the server to close")
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1566,6 +1576,7 @@ def main() raises:
+     print()
+ 
+     run_test[test_get_root]("GET /", passed, failed)
++    run_test[test_chunked_when_transfer_encoding_is_the_last_header]("chunked with Transfer-Encoding last", passed, failed)
+     run_test[test_content_length_header_name_must_match_exactly]("Content-Length matched as a header name only", passed, failed)
+     run_test[test_no_content_does_not_wait_for_a_body]("204/304 without Content-Length", passed, failed)
+     run_test[test_interim_100_continue_skipped]("100 Continue skipped", passed, failed)
+diff --git a/test_server.py b/test_server.py
+index 00cd799..3bf1f84 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -89,6 +89,18 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+             chunk = b"z" * (1 << 20)
+             for _ in range(101):
+                 self.wfile.write(chunk)
++        elif self.path == "/chunked-te-last":
++            # Transfer-Encoding as the *last* header (S3 orders it so), on a
++            # connection the server keeps open: the client must stop at the
++            # last chunk, not wait for the close.
++            self.wfile.write(
++                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
++                b"Transfer-Encoding: chunked\r\n\r\n"
++                b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
++            )
++            self.wfile.flush()
++            time.sleep(4)
++            self.close_connection = True
+         elif self.path == "/meta-content-length":
+             # A header whose name *ends* in Content-Length, sent first, with a
+             # body too large to arrive in the first read.
+-- 
+2.55.0
+

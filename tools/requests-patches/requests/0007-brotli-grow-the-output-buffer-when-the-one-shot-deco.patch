@@ -1,0 +1,124 @@
+From 60ef5abfce40924ff47c94244ac535b1fd4ba638 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:39:48 -0800
+Subject: [PATCH 07/10] brotli: grow the output buffer when the one-shot
+ decoder reports an error
+
+BrotliDecoderDecompress never returns NEEDS_MORE_OUTPUT: an output buffer
+that is too small is BROTLI_DECODER_RESULT_ERROR. The retry loop only
+grew the buffer on NEEDS_MORE_OUTPUT, so any body inflating more than
+8x (the first buffer) failed with "BrotliDecodeError: result=0";
+https://www.cloudflare.com/ (155 KB -> 1.3 MB) did. The buffer now grows
+on either result up to the existing ratio cap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ brotli_decompress.mojo | 14 +++++++++++---
+ test_client.mojo       | 13 +++++++++++++
+ test_server.py         | 19 +++++++++++++++++++
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/brotli_decompress.mojo b/brotli_decompress.mojo
+index bd9e68c..b7dda4f 100644
+--- a/brotli_decompress.mojo
++++ b/brotli_decompress.mojo
+@@ -39,8 +39,12 @@ def brotli_decode(brotlidec: OwnedDLHandle, data_addr: Int, data_len: Int) raise
+     var out_buf = unsafe_alloc[UInt8](out_capacity)
+     var out_size_ptr = unsafe_alloc[Int](1)
+ 
++    # BrotliDecoderDecompress is one-shot: when the output does not fit it
++    # returns BROTLI_DECODER_RESULT_ERROR (0), not NEEDS_MORE_OUTPUT (3), so
++    # both mean "try a larger buffer" until the ratio cap; only an error at
++    # the cap is reported as corrupt input.
+     var result = Int32(3)
+-    while result == Int32(3):
++    while result != Int32(1):
+         out_size_ptr[] = out_capacity
+         result = brotlidec.call["BrotliDecoderDecompress", Int32](
+             Int(data_len),
+@@ -48,15 +52,19 @@ def brotli_decode(brotlidec: OwnedDLHandle, data_addr: Int, data_len: Int) raise
+             Int(out_size_ptr),
+             Int(out_buf),
+         )
+-        if result == Int32(3):
++        if result == Int32(3) or result == Int32(0):
+             var new_cap = out_capacity * 2
+             var cap_limit = data_len * _MAX_DECOMP_RATIO
+             if cap_limit > _MAX_DECOMP_BYTES:
+                 cap_limit = _MAX_DECOMP_BYTES
+-            if new_cap > cap_limit:
++            if out_capacity >= cap_limit:
+                 out_buf.unsafe_free()
+                 out_size_ptr.unsafe_free()
++                if result == Int32(0):
++                    raise Error("BrotliDecodeError: result=0")
+                 raise Error("brotli decompression ratio limit exceeded")
++            if new_cap > cap_limit:
++                new_cap = cap_limit
+             var new_buf = unsafe_alloc[UInt8](new_cap)
+             _ = external_call["memcpy", Int](Int(new_buf), Int(out_buf), out_capacity)
+             out_buf.unsafe_free()
+diff --git a/test_client.mojo b/test_client.mojo
+index f559d0f..d8b3619 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1352,6 +1352,18 @@ def test_chunked_when_transfer_encoding_is_the_last_header() raises:
+     assert_true(_unix_time_secs() - t0 < 3, "did not wait for the server to close")
+ 
+ 
++def test_brotli_body_larger_than_8x() raises:
++    """A brotli body that inflates more than 8x (most HTML does) decodes."""
++    var client = HttpClient(allow_private_ips=True)
++    var resp = client.get(BASE + "/brotli-ratio-20")
++    assert_eq(resp.status_code, 200, "status_code")
++    assert_eq(
++        resp.body.byte_length(),
++        Int(atol(resp.headers.get("X-Decoded-Length"))),
++        "decoded length",
++    )
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1746,6 +1758,7 @@ def main() raises:
+     run_test[test_streaming_gzip_existing]("streaming gzip existing still works", passed, failed)
+ 
+     # Phase 12 tests
++    run_test[test_brotli_body_larger_than_8x]("brotli body over 8x", passed, failed)
+     run_test[test_zstd_decompression]("zstd decompression", passed, failed)
+     run_test[test_accept_encoding_zstd]("Accept-Encoding includes zstd", passed, failed)
+ 
+diff --git a/test_server.py b/test_server.py
+index 3bf1f84..ecd3fc8 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -299,6 +299,25 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+                 self.wfile.write(compressed)
+             except ImportError:
+                 self._respond(503, "Service Unavailable", {"error": "brotli not installed"})
++        elif self.path == "/brotli-ratio-20":
++            # Decompresses to ~20x its size: more than the decoder's first
++            # 8x output buffer, well under its 256x cap.
++            try:
++                import brotli as _brotli
++                import random as _random
++                r = _random.Random(7)
++                words = ["".join(r.choice("abcdefghij") for _ in range(5)) for _ in range(8)]
++                body = " ".join(r.choice(words) for _ in range(40000)).encode()
++                compressed = _brotli.compress(body)
++                self.send_response(200, "OK")
++                self.send_header("Content-Encoding", "br")
++                self.send_header("Content-Length", str(len(compressed)))
++                self.send_header("X-Decoded-Length", str(len(body)))
++                self.send_header("Connection", "close")
++                self.end_headers()
++                self.wfile.write(compressed)
++            except ImportError:
++                self._respond(503, "Service Unavailable", {"error": "brotli not installed"})
+         elif self.path == "/zstd":
+             try:
+                 import zstandard as _zstd
+-- 
+2.55.0
+

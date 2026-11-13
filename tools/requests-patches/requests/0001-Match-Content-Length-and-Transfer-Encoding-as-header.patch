@@ -1,0 +1,100 @@
+From 658131f273f31580e374e505acce121ae4f8e880 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:15:51 -0800
+Subject: [PATCH 01/10] Match Content-Length and Transfer-Encoding as header
+ names only
+
+_buf_content_length and _buf_has_chunked searched the whole header block
+for the text, so a header whose name ends in it (S3 returns user metadata
+as X-Amz-Meta-Content-Length) was read as the body length: the body came
+back truncated with status 200 and the rest of it was left on the
+keep-alive connection, where the next response failed to parse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo | 11 +++++++++--
+ test_client.mojo | 10 ++++++++++
+ test_server.py   |  9 +++++++++
+ 3 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index 130b404..87181e5 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -2197,8 +2197,13 @@ def _buf_content_length(buf: List[UInt8], header_end: Int) raises -> Int:
+     """
+     var i = 0
+     while i <= header_end - 15:
++        # Only a header *name* counts: the match must start a line. Otherwise
++        # `X-Amz-Meta-Content-Length: 5` (S3 user metadata) or a value that
++        # contains the text would be read as the body length.
+         if (
+-            _lc(buf[i]) == 99        # c
++            i > 0
++            and buf[i - 1] == 10     # \n: start of a header line
++            and _lc(buf[i]) == 99    # c
+             and _lc(buf[i+1]) == 111 # o
+             and _lc(buf[i+2]) == 110 # n
+             and _lc(buf[i+3]) == 116 # t
+@@ -2241,7 +2246,9 @@ def _buf_has_chunked(buf: List[UInt8], header_end: Int) -> Bool:
+     var i = 0
+     while i <= header_end - 18:
+         if (
+-            _lc(buf[i]) == 116       # t
++            i > 0
++            and buf[i - 1] == 10     # \n: a header name, not a substring
++            and _lc(buf[i]) == 116   # t
+             and _lc(buf[i+1]) == 114 # r
+             and _lc(buf[i+2]) == 97  # a
+             and _lc(buf[i+3]) == 110 # n
+diff --git a/test_client.mojo b/test_client.mojo
+index a3edc92..94985fa 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1277,6 +1277,15 @@ def test_redirect_private_ip_blocked() raises:
+ # ============================================================================
+ 
+ 
++def test_content_length_header_name_must_match_exactly() raises:
++    """`X-Amz-Meta-Content-Length: 5` must not be taken as the body length."""
++    var client = HttpClient(allow_private_ips=True)
++    var resp = client.get(BASE + "/meta-content-length")
++    assert_eq(resp.status_code, 200, "status_code")
++    assert_eq(resp.body.byte_length(), 100000, "whole body read")
++    assert_str_eq(resp.headers.get("X-Amz-Meta-Content-Length"), "5", "metadata header kept")
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1472,6 +1481,7 @@ def main() raises:
+     print()
+ 
+     run_test[test_get_root]("GET /", passed, failed)
++    run_test[test_content_length_header_name_must_match_exactly]("Content-Length matched as a header name only", passed, failed)
+     run_test[test_status_200]("status 200", passed, failed)
+     run_test[test_status_404]("status 404", passed, failed)
+     run_test[test_status_500]("status 500", passed, failed)
+diff --git a/test_server.py b/test_server.py
+index a1b55dc..4a104c0 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -61,6 +61,15 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+             self._respond(200, "OK", {"query": query})
+         elif self.path == "/method":
+             self._respond(200, "OK", {"method": "GET"})
++        elif self.path == "/meta-content-length":
++            # A header whose name *ends* in Content-Length, sent first, with a
++            # body too large to arrive in the first read.
++            body = b"y" * 100000
++            self.send_response(200)
++            self.send_header("X-Amz-Meta-Content-Length", "5")
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
+         elif self.path == "/redirect/301":
+             self.send_response(301, "Moved Permanently")
+             self.send_header("Location", "/redirect/target")
+-- 
+2.55.0
+

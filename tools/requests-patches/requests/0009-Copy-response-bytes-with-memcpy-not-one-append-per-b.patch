@@ -1,0 +1,107 @@
+From 91c10567712786f9518db0fa3f7f176821110eb4 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:02:00 -0800
+Subject: [PATCH 09/10] Copy response bytes with memcpy, not one append per
+ byte
+
+_list_append, _buf_leftover, _buf_to_string, the HEAD/204 header copy
+and StreamResponse.read_chunk/read_all appended byte by byte, and every
+response body passes through _list_append. With List.extend(Span(...)):
+local MinIO on an Apple M4, 256 MiB GETs over HTTP 1450 -> 2270 MB/s
+(CPU 0.57 -> 0.31 s/GB) and over HTTPS 1200 -> 1550 MB/s; 1 MiB range
+GETs over HTTPS 740 -> 880 MB/s (CPU 0.76 -> 0.54 s/GB).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo | 30 ++++++++++++------------------
+ 1 file changed, 12 insertions(+), 18 deletions(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index 7217214..d7ec65c 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -2038,8 +2038,9 @@ struct StreamResponse(Movable):
+         var leftover_avail = len(self._leftover) - self._leftover_pos
+         if leftover_avail > 0:
+             var take_n = min(size, leftover_avail)
+-            for i in range(take_n):
+-                result.append(self._leftover[self._leftover_pos + i])
++            result.extend(
++                Span(self._leftover)[self._leftover_pos : self._leftover_pos + take_n]
++            )
+             self._leftover_pos += take_n
+ 
+         # Fetch more from the socket if we still need bytes
+@@ -2067,8 +2068,7 @@ struct StreamResponse(Movable):
+                 if len(chunk) == 0:
+                     self._done = True
+                 else:
+-                    for i in range(len(chunk)):
+-                        result.append(chunk[i])
++                    result.extend(Span(chunk))
+ 
+         self._body_read += len(result)
+         if len(result) == 0:
+@@ -2084,8 +2084,7 @@ struct StreamResponse(Movable):
+             var chunk = self.read_chunk(65536)
+             if len(chunk) == 0:
+                 break
+-            for i in range(len(chunk)):
+-                buf.append(chunk[i])
++            buf.extend(Span(chunk))
+         return String(unsafe_from_utf8=buf)
+ 
+     def close(mut self) raises:
+@@ -2146,24 +2145,21 @@ def _buf_leftover(buf: List[UInt8], start: Int) -> List[UInt8]:
+     if start >= n:
+         return List[UInt8]()
+     var result = List[UInt8](capacity=n - start)
+-    for i in range(start, n):
+-        result.append(buf[i])
++    result.extend(Span(buf)[start:n])
+     return result^
+ 
+ 
+ def _buf_to_string(buf: List[UInt8], header_end: Int) -> String:
+     """Build a String from buf[0..header_end] — used to pass headers-only to _parse_response."""
+     var copy_buf = List[UInt8](capacity=header_end)
+-    for i in range(header_end):
+-        copy_buf.append(buf[i])
++    copy_buf.extend(Span(buf)[0:header_end])
+     return String(unsafe_from_utf8=copy_buf)
+ 
+ 
+ def _list_append(mut out: List[UInt8], src: List[UInt8]):
+-    """Append src bytes to out with pre-reservation."""
+-    out.reserve(len(out) + len(src))
+-    for i in range(len(src)):
+-        out.append(src[i])
++    """Append src bytes to out (one memcpy, not a loop of appends: this
++    carries every response body)."""
++    out.extend(Span(src))
+ 
+ 
+ def _buf_find_crlf_crlf(buf: List[UInt8]) -> Int:
+@@ -2418,8 +2414,7 @@ def _recv_tls_keepalive(
+     # and, on a keep-alive connection, hang until the read timeout.
+     if skip_body or status == 204 or status == 304:
+         var headers_only = List[UInt8](capacity=header_end + 4)
+-        for i in range(header_end + 4):
+-            headers_only.append(buf[i])
++        headers_only.extend(Span(buf)[0 : header_end + 4])
+         return headers_only^
+ 
+     # Phase 2: read body based on transfer mode
+@@ -2507,8 +2502,7 @@ def _recv_http_keepalive(
+     # and, on a keep-alive connection, hang until the read timeout.
+     if skip_body or status == 204 or status == 304:
+         var headers_only = List[UInt8](capacity=header_end + 4)
+-        for i in range(header_end + 4):
+-            headers_only.append(buf[i])
++        headers_only.extend(Span(buf)[0 : header_end + 4])
+         return headers_only^
+ 
+     # Phase 2: read body based on transfer mode
+-- 
+2.55.0
+

@@ -1,0 +1,202 @@
+From a040e47f9a1cb1fd78cb2428a4fdf16fc20e1d28 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:23:02 -0800
+Subject: [PATCH 10/10] Use HTTP/1.1 when the server answers no ALPN protocol,
+ without an HTTP/2 probe
+
+With no ALPN answer the client sent the HTTP/2 preface over the new TLS
+connection and, when that failed, made a second TCP+TLS connection for
+HTTP/1.1. HTTP/2 over TLS is only negotiated through ALPN (RFC 9113
+3.2), so the probe never finds h2, and it doubled the handshakes for
+every TLS 1.2 server (tls reports no ALPN result for 1.2) and for TLS
+1.3 servers without h2: one GET to sha256.badssl.com or to Azure Blob
+Storage opened 2 connections. Now 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ alpn_test_server.py     | 36 ++++++++++++++++++++
+ http_client.mojo        | 73 +++++++++++------------------------------
+ pixi.toml               |  1 +
+ test_alpn_fallback.mojo | 30 +++++++++++++++++
+ 4 files changed, 87 insertions(+), 53 deletions(-)
+ create mode 100644 alpn_test_server.py
+ create mode 100644 test_alpn_fallback.mojo
+
+diff --git a/alpn_test_server.py b/alpn_test_server.py
+new file mode 100644
+index 0000000..8b4d7d6
+--- /dev/null
++++ b/alpn_test_server.py
+@@ -0,0 +1,36 @@
++"""HTTPS test server that negotiates no ALPN protocol (like TLS 1.2 servers
++and HTTP/1.1-only TLS 1.3 servers). Serves keep-alive HTTP/1.1.
++
++Usage: python alpn_test_server.py <cert.pem> <key.pem> [port]
++"""
++import http.server
++import ssl
++import sys
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++
++    def do_GET(self):
++        body = b"ok"
++        self.send_response(200)
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *args):
++        pass
++
++
++def main():
++    cert, key = sys.argv[1], sys.argv[2]
++    port = int(sys.argv[3]) if len(sys.argv) > 3 else 18443
++    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    ctx.load_cert_chain(cert, key)  # no set_alpn_protocols: no ALPN answer
++    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
++    server.socket = ctx.wrap_socket(server.socket, server_side=True)
++    server.serve_forever()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/http_client.mojo b/http_client.mojo
+index d7ec65c..deb03f4 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -1085,60 +1085,27 @@ struct HttpClient(Movable):
+                     self._h2_times[h2_hit] = _unix_time_secs()
+                     return h2_resp^
+                 elif proto.byte_length() == 0:
+-                    # Server did not echo ALPN (TLS 1.2 fallback or silent h2).
+-                    # Probe H2 first; if the preface exchange fails, fall back to
+-                    # a fresh H1 connection (new_tls^ was consumed — cannot reuse).
+-                    var new_h2 = Http2Conn()
+-                    new_h2._tls = new_tls^
+-                    var h2_ok = False
+-                    try:
+-                        h2_preface_and_settings_exchange(new_h2)
+-                        h2_ok = True
+-                    except:
+-                        try:
+-                            new_h2.close()
+-                        except:
+-                            pass
+-
+-                    if h2_ok:
+-                        var evict = self._h2_evict_slot()
+-                        if self._h2_times[evict] > Int64(0):
+-                            self._h2_close_slot(evict)
+-                        self._h2_keys[evict]  = conn_key
+-                        self._h2_times[evict] = _unix_time_secs()
+-                        if evict == 0:
+-                            self._h2_conn0 = new_h2^
+-                        elif evict == 1:
+-                            self._h2_conn1 = new_h2^
+-                        elif evict == 2:
+-                            self._h2_conn2 = new_h2^
+-                        else:
+-                            self._h2_conn3 = new_h2^
+-                        h2_hit = evict
+-                        var h2_resp = self._h2_do_request(h2_hit, method, url, body, extra_headers)
+-                        self._h2_times[h2_hit] = _unix_time_secs()
+-                        return h2_resp^
++                    # No ALPN answer. HTTP/2 over TLS is only ever chosen
++                    # through ALPN (RFC 9113 3.2), so this is HTTP/1.1 on
++                    # the connection we have. (Probing with the HTTP/2
++                    # preface cost every TLS 1.2 server, and TLS 1.3 servers
++                    # without h2 such as Azure Blob, a second handshake.)
++                    _ = new_tls.send(req_buf)
++                    raw_bytes = _recv_tls_keepalive(new_tls, skip_body, self.max_response_bytes)
++                    var evict = self._tls_evict_slot()
++                    if self._tls_times[evict] > Int64(0):
++                        self._tls_close_slot(evict)
++                    self._tls_keys[evict]  = conn_key
++                    self._tls_times[evict] = _unix_time_secs()
++                    if evict == 0:
++                        self._tls_sock0 = new_tls^
++                    elif evict == 1:
++                        self._tls_sock1 = new_tls^
++                    elif evict == 2:
++                        self._tls_sock2 = new_tls^
+                     else:
+-                        # H2 probe failed — open fresh TCP+TLS (no ALPN) for H1
+-                        var fb_tcp = self._tcp_connect(url.host, url.port, "https")
+-                        var fb_tls = TlsSocket(fb_tcp.detach())
+-                        fb_tls.connect(url.host, self._ca_bundle)
+-                        _ = fb_tls.send(req_buf)
+-                        raw_bytes = _recv_tls_keepalive(fb_tls, skip_body, self.max_response_bytes)
+-                        var evict = self._tls_evict_slot()
+-                        if self._tls_times[evict] > Int64(0):
+-                            self._tls_close_slot(evict)
+-                        self._tls_keys[evict]  = conn_key
+-                        self._tls_times[evict] = _unix_time_secs()
+-                        if evict == 0:
+-                            self._tls_sock0 = fb_tls^
+-                        elif evict == 1:
+-                            self._tls_sock1 = fb_tls^
+-                        elif evict == 2:
+-                            self._tls_sock2 = fb_tls^
+-                        else:
+-                            self._tls_sock3 = fb_tls^
+-                        tls_hit = evict
++                        self._tls_sock3 = new_tls^
++                    tls_hit = evict
+                 else:
+                     # proto == "http/1.1": server explicitly chose H1 via ALPN
+                     _ = new_tls.send(req_buf)
+diff --git a/pixi.toml b/pixi.toml
+index 328de88..074abbb 100644
+--- a/pixi.toml
++++ b/pixi.toml
+@@ -13,6 +13,7 @@ test-h2 = "bash build_and_run.sh test_h2.mojo"
+ test-h2-conn = "bash build_and_run.sh test_h2_conn.mojo"
+ test-h2-client = "bash build_and_run.sh test_h2_client.mojo"
+ test-std-compat = "bash build_and_run.sh test_std_compat.mojo"
++test-alpn = "bash -c 'mkdir -p .build/alpn && openssl req -x509 -newkey rsa:2048 -nodes -keyout .build/alpn/key.pem -out .build/alpn/cert.pem -days 1 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 2>/dev/null && (python alpn_test_server.py .build/alpn/cert.pem .build/alpn/key.pem &) && sleep 1 && bash build_and_run.sh test_alpn_fallback.mojo; RET=$?; pkill -f alpn_test_server.py; exit $RET'"
+ format = "mblack http_client.mojo main.mojo test_client.mojo"
+ 
+ [dependencies]
+diff --git a/test_alpn_fallback.mojo b/test_alpn_fallback.mojo
+new file mode 100644
+index 0000000..2aaa5dc
+--- /dev/null
++++ b/test_alpn_fallback.mojo
+@@ -0,0 +1,30 @@
++# One connection per request to an HTTPS server that answers no ALPN
++# protocol: HTTP/1.1 on that connection, not an HTTP/2 probe and a second
++# handshake. Needs alpn_test_server.py on 127.0.0.1:18443 with the cert from
++# `pixi run test-alpn` (see pixi.toml).
++
++from http_client import HttpClient
++from crypto.cert import cert_parse
++from crypto.pem import pem_decode
++from std.os import getenv
++
++
++def main() raises:
++    var pem: String
++    with open(getenv("ALPN_TEST_CA", ".build/alpn/cert.pem"), "r") as f:
++        pem = f.read()
++    var client = HttpClient(allow_private_ips=True)
++    var ders = pem_decode(pem, "CERTIFICATE")
++    for i in range(len(ders)):
++        client._ca_bundle.append(cert_parse(ders[i]))
++    client._ca_loaded = True
++    for _ in range(3):
++        var resp = client.get("https://127.0.0.1:18443/")
++        if resp.status_code != 200 or resp.body != "ok":
++            raise Error("unexpected response " + String(resp.status_code))
++    if client.connections_opened != 1:
++        raise Error(
++            "expected 1 connection for 3 requests, opened "
++            + String(client.connections_opened)
++        )
++    print("test_alpn_fallback: PASS (3 requests, 1 connection)")
+-- 
+2.55.0
+

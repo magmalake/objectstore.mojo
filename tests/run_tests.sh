@@ -157,4 +157,17 @@ fi
 
 echo "== running tests"
 ./build/objectstore-test
-exit $?
+STATUS=$?
+
+# The same suite over the pure-Mojo requests backend (objectstore#24), when
+# its sources are checked out: tools/fetch_requests.sh puts them in .deps/.
+DEPS="${OBJECTSTORE_REQUESTS_DEPS:-}"
+if [ -n "$DEPS" ]; then
+    echo "== building tests on the requests backend ($DEPS)"
+    mojo build tests/requests_backend_test.mojo -I src -I tests \
+        -I "$DEPS/requests" -I "$DEPS/tls" -I "$DEPS/tcp" -I "$DEPS/url" \
+        -I "$DEPS/json" -o build/requests-backend-test || exit 1
+    echo "== running tests on the requests backend"
+    ./build/requests-backend-test || STATUS=1
+fi
+exit $STATUS
