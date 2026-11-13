@@ -1,7 +1,7 @@
 From b3108af314e513bda76e443ca3458eaaca615bd2 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:22:15 -0800
-Subject: [PATCH 2/9] Don't wait for a body after 204, 304 or an interim 1xx
+Subject: [PATCH 02/10] Don't wait for a body after 204, 304 or an interim 1xx
 
 A 204 or 304 without Content-Length on a keep-alive connection fell into
 the read-until-close branch and waited for the read timeout (S3 answers

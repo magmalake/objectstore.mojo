@@ -1,7 +1,7 @@
 From 5189f3da54943c794239096759c812027609e927 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:36:06 -0800
-Subject: [PATCH 6/9] Detect chunked encoding when Transfer-Encoding is the
+Subject: [PATCH 06/10] Detect chunked encoding when Transfer-Encoding is the
  last header
 
 _buf_has_chunked searched the value up to header_end - 1, one byte

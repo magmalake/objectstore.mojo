@@ -1,7 +1,7 @@
 From c2cdcaa7a4e1941dc7220fd8fe4183083abd0b27 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:49:33 -0800
-Subject: [PATCH 8/9] Caller headers replace the defaults;
+Subject: [PATCH 08/10] Caller headers replace the defaults;
  HttpClient.decompress can turn decoding off
 
 A request with its own Host header went out with two (a 400 from S3 and

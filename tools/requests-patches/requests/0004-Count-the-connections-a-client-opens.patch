@@ -1,7 +1,7 @@
 From b619e00abcf790cb8f519111f836cbfd0a6bc252 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:25:27 -0800
-Subject: [PATCH 4/9] Count the connections a client opens
+Subject: [PATCH 04/10] Count the connections a client opens
 
 HttpClient.connections_opened lets a caller check that keep-alive
 pooling works (requests made vs connections opened), the way curl's

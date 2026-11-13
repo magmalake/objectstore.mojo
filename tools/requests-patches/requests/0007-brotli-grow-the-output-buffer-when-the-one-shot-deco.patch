@@ -1,8 +1,8 @@
 From 60ef5abfce40924ff47c94244ac535b1fd4ba638 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:39:48 -0800
-Subject: [PATCH 7/9] brotli: grow the output buffer when the one-shot decoder
- reports an error
+Subject: [PATCH 07/10] brotli: grow the output buffer when the one-shot
+ decoder reports an error
 
 BrotliDecoderDecompress never returns NEEDS_MORE_OUTPUT: an output buffer
 that is too small is BROTLI_DECODER_RESULT_ERROR. The retry loop only

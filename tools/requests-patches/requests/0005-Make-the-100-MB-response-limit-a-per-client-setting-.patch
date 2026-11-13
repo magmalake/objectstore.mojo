@@ -1,7 +1,7 @@
 From de22df22228592971a7e3523fe57b5b4f3d45a91 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:27:07 -0800
-Subject: [PATCH 5/9] Make the 100 MB response limit a per-client setting;
+Subject: [PATCH 05/10] Make the 100 MB response limit a per-client setting;
  don't cap streams
 
 HttpClient.max_response_bytes (default MAX_RESPONSE_BYTES, 100 MB) is

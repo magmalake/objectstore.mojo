@@ -1,7 +1,8 @@
 From 91c10567712786f9518db0fa3f7f176821110eb4 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 08:02:00 -0800
-Subject: [PATCH 9/9] Copy response bytes with memcpy, not one append per byte
+Subject: [PATCH 09/10] Copy response bytes with memcpy, not one append per
+ byte
 
 _list_append, _buf_leftover, _buf_to_string, the HEAD/204 header copy
 and StreamResponse.read_chunk/read_all appended byte by byte, and every

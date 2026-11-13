@@ -1,7 +1,7 @@
 From f383b786f03718566e0cfd150afc5cefbb47a8f4 Mon Sep 17 00:00:00 2001
 From: Marius S <39998+winding-lines@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 07:24:04 -0800
-Subject: [PATCH 3/9] Request bodies: default Content-Type can be turned off;
+Subject: [PATCH 03/10] Request bodies: default Content-Type can be turned off;
  empty PUT/POST/PATCH send Content-Length: 0
 
 HttpClient.default_content_type (still "application/json" by default)
