@@ -1,0 +1,308 @@
+From de22df22228592971a7e3523fe57b5b4f3d45a91 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:27:07 -0800
+Subject: [PATCH 5/9] Make the 100 MB response limit a per-client setting;
+ don't cap streams
+
+HttpClient.max_response_bytes (default MAX_RESPONSE_BYTES, 100 MB) is
+the largest body a request buffers. get_stream does not buffer, so it no
+longer refuses a Content-Length over the limit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo | 62 +++++++++++++++++++++++++++++-------------------
+ test_client.mojo | 31 ++++++++++++++++++++++++
+ test_server.py   |  8 +++++++
+ 3 files changed, 76 insertions(+), 25 deletions(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index 27c12aa..d3eb747 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -405,6 +405,7 @@ struct HttpClient(Movable):
+     var proxy_url: String               # HTTP proxy URL, e.g. "http://host:port" (empty = no proxy)
+     var default_content_type: String    # Content-Type for a body sent without one ("" = send none)
+     var connections_opened: Int         # TCP connections this client has opened (pool reuse = fewer)
++    var max_response_bytes: Int         # largest body _do_request buffers (default 100 MB)
+     var _timeout_secs: Int              # socket send/recv timeout (seconds)
+ 
+     # CA bundle cache — loaded once on first HTTPS request
+@@ -471,6 +472,7 @@ struct HttpClient(Movable):
+         self.proxy_url = String("")
+         self.default_content_type = String("application/json")
+         self.connections_opened = 0
++        self.max_response_bytes = MAX_RESPONSE_BYTES
+         self._timeout_secs = timeout_secs
+         self._ca_bundle = List[X509Cert]()
+         self._ca_loaded = False
+@@ -526,6 +528,7 @@ struct HttpClient(Movable):
+         self.proxy_url = move.proxy_url^
+         self.default_content_type = move.default_content_type^
+         self.connections_opened = move.connections_opened
++        self.max_response_bytes = move.max_response_bytes
+         self._timeout_secs = move._timeout_secs
+         self._ca_bundle = move._ca_bundle^
+         self._ca_loaded = move._ca_loaded
+@@ -670,7 +673,8 @@ struct HttpClient(Movable):
+ 
+         var hdr_str = _buf_to_string(raw_buf, header_end + 4)
+         var parsed = _parse_response(hdr_str, url_str)
+-        var cl = _buf_content_length(raw_buf, header_end)
++        # The body is not buffered here, so its length is not capped.
++        var cl = _buf_content_length(raw_buf, header_end, Int.MAX)
+         var leftover = _buf_leftover(raw_buf, header_end + 4)
+ 
+         var stream = StreamResponse()
+@@ -1111,7 +1115,7 @@ struct HttpClient(Movable):
+                         var fb_tls = TlsSocket(fb_tcp.detach())
+                         fb_tls.connect(url.host, self._ca_bundle)
+                         _ = fb_tls.send(req_buf)
+-                        raw_bytes = _recv_tls_keepalive(fb_tls, skip_body)
++                        raw_bytes = _recv_tls_keepalive(fb_tls, skip_body, self.max_response_bytes)
+                         var evict = self._tls_evict_slot()
+                         if self._tls_times[evict] > Int64(0):
+                             self._tls_close_slot(evict)
+@@ -1129,7 +1133,7 @@ struct HttpClient(Movable):
+                 else:
+                     # proto == "http/1.1": server explicitly chose H1 via ALPN
+                     _ = new_tls.send(req_buf)
+-                    raw_bytes = _recv_tls_keepalive(new_tls, skip_body)
++                    raw_bytes = _recv_tls_keepalive(new_tls, skip_body, self.max_response_bytes)
+                     var evict = self._tls_evict_slot()
+                     if self._tls_times[evict] > Int64(0):
+                         self._tls_close_slot(evict)
+@@ -1170,7 +1174,7 @@ struct HttpClient(Movable):
+                 var new_sock = self._tcp_connect(url.host, url.port)
+                 var request = String(unsafe_from_utf8=req_buf)
+                 _ = new_sock.send(request)
+-                raw_bytes = _recv_http_keepalive(new_sock, skip_body)
++                raw_bytes = _recv_http_keepalive(new_sock, skip_body, self.max_response_bytes)
+                 var evict = self._http_evict_slot()
+                 if self._http_times[evict] > Int64(0):
+                     self._http_close_slot(evict)
+@@ -1192,7 +1196,7 @@ struct HttpClient(Movable):
+ 
+         # Convert to string and parse
+         var raw_response = String(unsafe_from_utf8=raw_bytes)
+-        var parsed = _parse_response(raw_response, url_str)
++        var parsed = _parse_response(raw_response, url_str, self.max_response_bytes)
+ 
+         # Decompress body if Content-Encoding is set.
+         # Phase 14: use _ptr variants — decompress directly from the body's
+@@ -1260,16 +1264,16 @@ struct HttpClient(Movable):
+         """Send request and recv response on HTTP pool slot i (raises on failure)."""
+         if i == 0:
+             _ = self._http_sock0.send(request)
+-            return _recv_http_keepalive(self._http_sock0, skip_body)
++            return _recv_http_keepalive(self._http_sock0, skip_body, self.max_response_bytes)
+         elif i == 1:
+             _ = self._http_sock1.send(request)
+-            return _recv_http_keepalive(self._http_sock1, skip_body)
++            return _recv_http_keepalive(self._http_sock1, skip_body, self.max_response_bytes)
+         elif i == 2:
+             _ = self._http_sock2.send(request)
+-            return _recv_http_keepalive(self._http_sock2, skip_body)
++            return _recv_http_keepalive(self._http_sock2, skip_body, self.max_response_bytes)
+         else:
+             _ = self._http_sock3.send(request)
+-            return _recv_http_keepalive(self._http_sock3, skip_body)
++            return _recv_http_keepalive(self._http_sock3, skip_body, self.max_response_bytes)
+ 
+     # -------------------------------------------------------------------------
+     # LRU-4 Pool Helpers — TLS
+@@ -1315,16 +1319,16 @@ struct HttpClient(Movable):
+         """Send request and recv response on TLS pool slot i (raises on failure)."""
+         if i == 0:
+             _ = self._tls_sock0.send(req_buf)
+-            return _recv_tls_keepalive(self._tls_sock0, skip_body)
++            return _recv_tls_keepalive(self._tls_sock0, skip_body, self.max_response_bytes)
+         elif i == 1:
+             _ = self._tls_sock1.send(req_buf)
+-            return _recv_tls_keepalive(self._tls_sock1, skip_body)
++            return _recv_tls_keepalive(self._tls_sock1, skip_body, self.max_response_bytes)
+         elif i == 2:
+             _ = self._tls_sock2.send(req_buf)
+-            return _recv_tls_keepalive(self._tls_sock2, skip_body)
++            return _recv_tls_keepalive(self._tls_sock2, skip_body, self.max_response_bytes)
+         else:
+             _ = self._tls_sock3.send(req_buf)
+-            return _recv_tls_keepalive(self._tls_sock3, skip_body)
++            return _recv_tls_keepalive(self._tls_sock3, skip_body, self.max_response_bytes)
+ 
+     # -------------------------------------------------------------------------
+     # LRU-4 Pool Helpers — H2
+@@ -2222,7 +2226,9 @@ def _lc(b: UInt8) -> UInt8:
+     return b
+ 
+ 
+-def _buf_content_length(buf: List[UInt8], header_end: Int) raises -> Int:
++def _buf_content_length(
++    buf: List[UInt8], header_end: Int, max_bytes: Int = MAX_RESPONSE_BYTES
++) raises -> Int:
+     """Scan buf[0..header_end] case-insensitively for 'content-length: N'.
+ 
+     Returns N or -1 if not found.
+@@ -2262,7 +2268,7 @@ def _buf_content_length(buf: List[UInt8], header_end: Int) raises -> Int:
+                 if c < 48 or c > 57:
+                     break
+                 var digit = Int(c - 48)
+-                if result > (MAX_RESPONSE_BYTES - digit) // 10:
++                if result > (max_bytes - digit) // 10:
+                     raise _err_parse("Content-Length value overflows response size limit")
+                 result = result * 10 + digit
+                 pos += 1
+@@ -2348,7 +2354,9 @@ def _str_contains(haystack: String, needle: String) -> Bool:
+ 
+ 
+ def _recv_tls_keepalive(
+-    mut sock: TlsSocket, skip_body: Bool = False
++    mut sock: TlsSocket,
++    skip_body: Bool = False,
++    max_bytes: Int = MAX_RESPONSE_BYTES,
+ ) raises -> List[UInt8]:
+     """Read exactly one complete HTTP response from a TLS keep-alive connection.
+ 
+@@ -2393,9 +2401,9 @@ def _recv_tls_keepalive(
+         return headers_only^
+ 
+     # Phase 2: read body based on transfer mode
+-    var cl = _buf_content_length(buf, header_end)
++    var cl = _buf_content_length(buf, header_end, max_bytes)
+     if cl >= 0:
+-        if cl > MAX_RESPONSE_BYTES:
++        if cl > max_bytes:
+             raise _err_connection("Content-Length exceeds response size limit")
+         # Pre-allocate to avoid reallocs for known body size (Phase 5.1)
+         buf.reserve(header_end + 4 + cl)
+@@ -2439,7 +2447,9 @@ def _recv_tls_keepalive(
+ 
+ 
+ def _recv_http_keepalive(
+-    mut sock: TcpSocket, skip_body: Bool = False
++    mut sock: TcpSocket,
++    skip_body: Bool = False,
++    max_bytes: Int = MAX_RESPONSE_BYTES,
+ ) raises -> List[UInt8]:
+     """Read exactly one complete HTTP response from a TCP keep-alive connection.
+ 
+@@ -2480,9 +2490,9 @@ def _recv_http_keepalive(
+         return headers_only^
+ 
+     # Phase 2: read body based on transfer mode
+-    var cl = _buf_content_length(buf, header_end)
++    var cl = _buf_content_length(buf, header_end, max_bytes)
+     if cl >= 0:
+-        if cl > MAX_RESPONSE_BYTES:
++        if cl > max_bytes:
+             raise _err_connection("Content-Length exceeds response size limit")
+         # Pre-allocate to avoid reallocs for known body size (Phase 5.1)
+         buf.reserve(header_end + 4 + cl)
+@@ -2920,7 +2930,7 @@ def _hex_to_int(
+     return result
+ 
+ 
+-def _decode_chunked(body: String) raises -> String:
++def _decode_chunked(body: String, max_bytes: Int = MAX_RESPONSE_BYTES) raises -> String:
+     """Decode a chunked transfer-encoded body.
+ 
+     Format: <hex-size>\\r\\n<data>\\r\\n ... 0\\r\\n\\r\\n
+@@ -2961,7 +2971,7 @@ def _decode_chunked(body: String) raises -> String:
+                 + " available"
+             )
+         total_decoded += chunk_size
+-        if total_decoded > MAX_RESPONSE_BYTES:
++        if total_decoded > max_bytes:
+             raise _err_connection("chunked body exceeds response size limit")
+         var current_len = len(result)
+         result.resize(current_len + chunk_size, 0)
+@@ -2972,7 +2982,9 @@ def _decode_chunked(body: String) raises -> String:
+     return String(unsafe_from_utf8=result)
+ 
+ 
+-def _parse_response(raw: String, url: String) raises -> HttpResponse:
++def _parse_response(
++    raw: String, url: String, max_bytes: Int = MAX_RESPONSE_BYTES
++) raises -> HttpResponse:
+     """Parse a raw HTTP response string into an HttpResponse.
+ 
+     Uses UnsafePointer for zero-copy parsing — converts the raw response
+@@ -3068,7 +3080,7 @@ def _parse_response(raw: String, url: String) raises -> HttpResponse:
+     # Decode chunked body if needed
+     var te = response.headers.get("Transfer-Encoding")
+     if _eq_ignore_case(te, String("chunked")):
+-        response.body = _decode_chunked(response.body)
++        response.body = _decode_chunked(response.body, max_bytes)
+ 
+     return response^
+ 
+diff --git a/test_client.mojo b/test_client.mojo
+index 7fa1ab2..c1d5be5 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1363,6 +1363,35 @@ def test_content_length_over_limit() raises:
+         raise Error("expected error for oversized Content-Length")
+ 
+ 
++def test_max_response_bytes_is_configurable() raises:
++    """The buffering limit is per client: lower it and a 100 KB body is
++    refused, raise it and the same body is read."""
++    var client = HttpClient(allow_private_ips=True)
++    client.max_response_bytes = 1000
++    var raised = False
++    try:
++        _ = client.get(BASE + "/meta-content-length")
++    except:
++        raised = True
++    assert_true(raised, "100 KB body over a 1000-byte limit raises")
++    client.max_response_bytes = 200000
++    assert_eq(client.get(BASE + "/meta-content-length").body.byte_length(), 100000, "under the limit")
++
++
++def test_stream_not_capped_at_100mb() raises:
++    """get_stream does not buffer, so a body over 100 MB can be streamed."""
++    var client = HttpClient(allow_private_ips=True)
++    var stream = client.get_stream(BASE + "/stream/over-100mb")
++    var total = 0
++    while True:
++        var chunk = stream.read_chunk(1 << 20)
++        if len(chunk) == 0:
++            break
++        total += len(chunk)
++    stream.close()
++    assert_eq(total, 101 * 1024 * 1024, "streamed bytes")
++
++
+ # ============================================================================
+ # Phase 11 Tests — Security Parity
+ # ============================================================================
+@@ -1543,6 +1572,8 @@ def main() raises:
+     run_test[test_default_content_type_can_be_turned_off]("default Content-Type can be turned off", passed, failed)
+     run_test[test_empty_put_sends_content_length_zero]("empty PUT/POST sends Content-Length: 0", passed, failed)
+     run_test[test_connections_opened_counts_connects]("connections_opened counter", passed, failed)
++    run_test[test_max_response_bytes_is_configurable]("max_response_bytes configurable", passed, failed)
++    run_test[test_stream_not_capped_at_100mb]("stream over 100 MB", passed, failed)
+     run_test[test_status_200]("status 200", passed, failed)
+     run_test[test_status_404]("status 404", passed, failed)
+     run_test[test_status_500]("status 500", passed, failed)
+diff --git a/test_server.py b/test_server.py
+index 185a718..00cd799 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -81,6 +81,14 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+             self.send_header("Connection", "close")
+             self.end_headers()
+             self.wfile.write(b"ok")
++        elif self.path == "/stream/over-100mb":
++            size = 101 * 1024 * 1024
++            self.send_response(200)
++            self.send_header("Content-Length", str(size))
++            self.end_headers()
++            chunk = b"z" * (1 << 20)
++            for _ in range(101):
++                self.wfile.write(chunk)
+         elif self.path == "/meta-content-length":
+             # A header whose name *ends* in Content-Length, sent first, with a
+             # body too large to arrive in the first read.
+-- 
+2.55.0
+

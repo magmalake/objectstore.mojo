@@ -67,6 +67,11 @@ jobs:
       - name: Unit tests and CLI build
         run: pixi run -e ${{ matrix.env }} check
 
+      # The prototype backend over Mosaad-M/requests (objectstore#24): the
+      # same suite, through the same servers, with libcurl out of the path.
+      - name: Tests on the requests backend
+        run: pixi run -e ${{ matrix.env }} test-requests
+
       # Through `pixi run`, with $CONDA_PREFIX set, and then from the plain
       # shell, where the shim is found through the binary's rpath.
       - name: CLI smoke

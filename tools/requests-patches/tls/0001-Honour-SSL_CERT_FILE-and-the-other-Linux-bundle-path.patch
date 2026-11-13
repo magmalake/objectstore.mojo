@@ -1,0 +1,183 @@
+From e17e6ac5b9fc0a7f8c9861ed596d0e715eb676fb Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:28:01 -0800
+Subject: [PATCH] Honour SSL_CERT_FILE and the other Linux bundle paths; add
+ load_ca_bundle(path)
+
+load_system_ca_bundle read one fixed path per platform, so Fedora/RHEL/
+Amazon Linux (/etc/pki/tls/certs/ca-bundle.crt), openSUSE and Alpine had
+no trust anchors, and there was no way to trust a private CA (a test
+server, a corporate proxy) short of parsing PEM by hand. It now reads
+$SSL_CERT_FILE when set, as OpenSSL, curl and Python do, then the first
+distribution path that exists. load_ca_bundle(path) is the same parser
+for any PEM file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ pixi.toml                     |  2 ++
+ tests/test_ca_bundle_env.mojo | 54 +++++++++++++++++++++++++++++++++++
+ tls/socket.mojo               | 41 ++++++++++++++++++++++----
+ 3 files changed, 92 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_ca_bundle_env.mojo
+
+diff --git a/pixi.toml b/pixi.toml
+index 1b88be1..771f028 100644
+--- a/pixi.toml
++++ b/pixi.toml
+@@ -26,6 +26,7 @@ test-record = "mojo run -I . tests/test_record.mojo"
+ test-record-eof = "mojo run -I . -I tests tests/test_record_eof.mojo"
+ test-socket-io = "mojo run -I . -I tests tests/test_socket_io.mojo"
+ test-ffi-compat = "mojo run -I . tests/test_ffi_compat.mojo"
++test-ca-bundle-env = "mojo run -I . tests/test_ca_bundle_env.mojo"
+ test-ct-crypto = "mojo run -I . -I tests tests/test_ct_crypto.mojo"
+ test-protocol = "mojo run -I . tests/test_protocol.mojo"
+ test-review-fixes = "mojo run -I . -I tests tests/test_review_fixes.mojo"
+@@ -71,6 +72,7 @@ format-hash = "mblack crypto/hash.mojo tests/test_hash.mojo"
+ # Composite task — excludes test-connection, test-connection12, test-socket
+ # (those require local cert files and a running Python TLS server)
+ test = { depends-on = [
++    "test-ca-bundle-env",
+   "test-hash", "test-hmac", "test-hkdf", "test-hkdf-sha384",
+   "test-aes", "test-gcm", "test-chacha20", "test-poly1305",
+   "test-bigint", "test-rsa", "test-curve25519", "test-p256", "test-p384",
+diff --git a/tests/test_ca_bundle_env.mojo b/tests/test_ca_bundle_env.mojo
+new file mode 100644
+index 0000000..c6820b5
+--- /dev/null
++++ b/tests/test_ca_bundle_env.mojo
+@@ -0,0 +1,54 @@
++# SSL_CERT_FILE selects the CA bundle, and load_ca_bundle reads any PEM file.
++from std.os import setenv, unsetenv
++from tls.socket import load_system_ca_bundle, load_ca_bundle
++
++
++def _first_pem_block(bundle: String) raises -> String:
++    var start = bundle.find("-----BEGIN CERTIFICATE-----")
++    var end_marker = "-----END CERTIFICATE-----"
++    var end = bundle.find(end_marker, start)
++    if start < 0 or end < 0:
++        raise Error("no certificate in the system bundle")
++    return String(bundle[byte=start : end + end_marker.byte_length()]) + "\n"
++
++
++def main() raises:
++    var system = load_system_ca_bundle()
++    if len(system) < 10:
++        raise Error("system bundle: only " + String(len(system)) + " certs")
++
++    # One certificate from the system bundle, on its own.
++    var path = String("/tmp/tls_test_ca_bundle_env.pem")
++    var bundle_path = String("/etc/ssl/cert.pem")
++    try:
++        with open("/etc/ssl/certs/ca-certificates.crt", "r") as f:
++            _ = f.read(1)
++        bundle_path = "/etc/ssl/certs/ca-certificates.crt"
++    except:
++        pass
++    var text: String
++    with open(bundle_path, "r") as f:
++        text = f.read()
++    with open(path, "w") as f:
++        f.write(_first_pem_block(text))
++
++    var one = load_ca_bundle(path)
++    if len(one) != 1:
++        raise Error("load_ca_bundle: expected 1 cert, got " + String(len(one)))
++
++    _ = setenv("SSL_CERT_FILE", path)
++    var from_env = load_system_ca_bundle()
++    _ = unsetenv("SSL_CERT_FILE")
++    if len(from_env) != 1:
++        raise Error("SSL_CERT_FILE ignored: got " + String(len(from_env)) + " certs")
++
++    _ = setenv("SSL_CERT_FILE", "/nonexistent/bundle.pem")
++    var raised = False
++    try:
++        _ = load_system_ca_bundle()
++    except:
++        raised = True
++    _ = unsetenv("SSL_CERT_FILE")
++    if not raised:
++        raise Error("a missing SSL_CERT_FILE must raise, not fall back")
++    print("test_ca_bundle_env: PASS (system bundle", len(system), "certs)")
+diff --git a/tls/socket.mojo b/tls/socket.mojo
+index 4dadb34..35c0e81 100644
+--- a/tls/socket.mojo
++++ b/tls/socket.mojo
+@@ -3,7 +3,8 @@
+ # ============================================================================
+ # API:
+ #   def load_system_ca_bundle() raises -> List[X509Cert]
+-#       Reads /etc/ssl/certs/ca-certificates.crt, parses all CERTIFICATE blocks.
++#       Reads $SSL_CERT_FILE, else the platform's bundle; parses all CERTIFICATE blocks.
++#   def load_ca_bundle(path: String) raises -> List[X509Cert]
+ #
+ #   struct TlsSocket(Movable):
+ #       def __init__(out self, tcp_fd: Int32 = 0)
+@@ -26,6 +27,8 @@
+ 
+ from std.ffi import external_call
+ from std.sys.info import CompilationTarget
++from std.os import getenv
++from std.os.path import exists
+ from crypto.cert import X509Cert, cert_parse
+ from crypto.pem import pem_decode
+ from crypto.hash import SHA256, SHA384
+@@ -121,22 +124,50 @@ def _sock_wrap_hs_msg(msg_type: UInt8, body: List[UInt8]) -> List[UInt8]:
+ # load_system_ca_bundle
+ # ============================================================================
+ 
++comptime _LINUX_CA_BUNDLES: List[StaticString] = [
++    "/etc/ssl/certs/ca-certificates.crt",  # Debian, Ubuntu, Arch, Gentoo
++    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, RHEL, Amazon Linux
++    "/etc/ssl/ca-bundle.pem",  # openSUSE
++    "/etc/ssl/cert.pem",  # Alpine
++]
++
++
+ def load_system_ca_bundle() raises -> List[X509Cert]:
+     """Load trusted CA certificates from the system CA bundle.
+ 
++    `SSL_CERT_FILE`, when set, names the bundle (as for OpenSSL, curl and
++    Python), e.g. a conda environment's `$CONDA_PREFIX/ssl/cacert.pem` or a
++    private CA for a test server. Otherwise:
+     macOS: /etc/ssl/cert.pem
+-    Linux: /etc/ssl/certs/ca-certificates.crt
++    Linux: the first of the usual distribution paths that exists.
++    """
++    var env = getenv("SSL_CERT_FILE")
++    if env.byte_length() > 0:
++        return load_ca_bundle(env)
++    comptime if CompilationTarget.is_macos():
++        return load_ca_bundle("/etc/ssl/cert.pem")
++    else:
++        comptime for k in range(len(_LINUX_CA_BUNDLES)):
++            comptime candidate = _LINUX_CA_BUNDLES[k]
++            if exists(candidate):
++                return load_ca_bundle(candidate)
++        raise Error(
++            "load_system_ca_bundle: no CA bundle found (set SSL_CERT_FILE)"
++        )
++
++
++def load_ca_bundle(path: String) raises -> List[X509Cert]:
++    """Load the CERTIFICATE blocks of a PEM file as trust anchors.
++
+     PEM-decodes all CERTIFICATE blocks, and cert_parses each one.
+     Silently skips certs that fail to parse.
+     """
+-    comptime CA_BUNDLE = "/etc/ssl/cert.pem" if CompilationTarget.is_macos() else "/etc/ssl/certs/ca-certificates.crt"
+-    var path = String(CA_BUNDLE)
+     var raw: List[UInt8]
+     try:
+         with open(path, "r") as f:
+             raw = f.read_bytes()
+     except:
+-        raise Error("load_system_ca_bundle: cannot open " + path)
++        raise Error("load_ca_bundle: cannot open " + path)
+     # Not validated as UTF-8 (read() would be): only the ASCII PEM blocks
+     # matter, and a stray byte in a comment must not lose the whole bundle
+     var content = String(unsafe_from_utf8=raw)
+-- 
+2.55.0
+

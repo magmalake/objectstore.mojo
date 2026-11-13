@@ -1,0 +1,99 @@
+From b619e00abcf790cb8f519111f836cbfd0a6bc252 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:25:27 -0800
+Subject: [PATCH 4/9] Count the connections a client opens
+
+HttpClient.connections_opened lets a caller check that keep-alive
+pooling works (requests made vs connections opened), the way curl's
+CURLINFO_NUM_CONNECTS does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo |  7 ++++++-
+ test_client.mojo | 10 ++++++++++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index 63ee989..27c12aa 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -404,6 +404,7 @@ struct HttpClient(Movable):
+     var pool_idle_timeout_secs: Int     # evict pool connections idle longer than this (default 300)
+     var proxy_url: String               # HTTP proxy URL, e.g. "http://host:port" (empty = no proxy)
+     var default_content_type: String    # Content-Type for a body sent without one ("" = send none)
++    var connections_opened: Int         # TCP connections this client has opened (pool reuse = fewer)
+     var _timeout_secs: Int              # socket send/recv timeout (seconds)
+ 
+     # CA bundle cache — loaded once on first HTTPS request
+@@ -469,6 +470,7 @@ struct HttpClient(Movable):
+         self.pool_idle_timeout_secs = 300
+         self.proxy_url = String("")
+         self.default_content_type = String("application/json")
++        self.connections_opened = 0
+         self._timeout_secs = timeout_secs
+         self._ca_bundle = List[X509Cert]()
+         self._ca_loaded = False
+@@ -523,6 +525,7 @@ struct HttpClient(Movable):
+         self.pool_idle_timeout_secs = move.pool_idle_timeout_secs
+         self.proxy_url = move.proxy_url^
+         self.default_content_type = move.default_content_type^
++        self.connections_opened = move.connections_opened
+         self._timeout_secs = move._timeout_secs
+         self._ca_bundle = move._ca_bundle^
+         self._ca_loaded = move._ca_loaded
+@@ -631,6 +634,7 @@ struct HttpClient(Movable):
+ 
+         var header_end = -1
+ 
++        self.connections_opened += 1
+         if is_tls:
+             if not self._ca_loaded:
+                 self._ca_bundle = load_system_ca_bundle()
+@@ -1494,7 +1498,7 @@ struct HttpClient(Movable):
+     # -------------------------------------------------------------------------
+ 
+     def _tcp_connect(
+-        self, target_host: String, target_port: Int, scheme: String = "http"
++        mut self, target_host: String, target_port: Int, scheme: String = "http"
+     ) raises -> TcpSocket:
+         """Return a TcpSocket connected to target_host:target_port.
+ 
+@@ -1504,6 +1508,7 @@ struct HttpClient(Movable):
+ 
+         If no proxy is configured, connects directly (normal behaviour).
+         """
++        self.connections_opened += 1
+         # Determine effective proxy URL: field takes priority over env vars
+         var effective_proxy = self.proxy_url
+         if effective_proxy.byte_length() == 0:
+diff --git a/test_client.mojo b/test_client.mojo
+index 2068e77..7fa1ab2 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1333,6 +1333,15 @@ def test_empty_put_sends_content_length_zero() raises:
+     assert_str_eq(dele["content_length"].as_string(), "", "DELETE sends none")
+ 
+ 
++def test_connections_opened_counts_connects() raises:
++    """test_server.py closes every connection, so each request opens one."""
++    var client = HttpClient(allow_private_ips=True)
++    assert_eq(client.connections_opened, 0, "fresh client")
++    for _ in range(3):
++        _ = client.get(BASE + "/status/200")
++    assert_eq(client.connections_opened, 3, "one per closed connection")
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1533,6 +1542,7 @@ def main() raises:
+     run_test[test_interim_100_continue_skipped]("100 Continue skipped", passed, failed)
+     run_test[test_default_content_type_can_be_turned_off]("default Content-Type can be turned off", passed, failed)
+     run_test[test_empty_put_sends_content_length_zero]("empty PUT/POST sends Content-Length: 0", passed, failed)
++    run_test[test_connections_opened_counts_connects]("connections_opened counter", passed, failed)
+     run_test[test_status_200]("status 200", passed, failed)
+     run_test[test_status_404]("status 404", passed, failed)
+     run_test[test_status_500]("status 500", passed, failed)
+-- 
+2.55.0
+

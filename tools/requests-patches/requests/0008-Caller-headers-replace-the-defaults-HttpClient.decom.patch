@@ -1,0 +1,219 @@
+From c2cdcaa7a4e1941dc7220fd8fe4183083abd0b27 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:49:33 -0800
+Subject: [PATCH 8/9] Caller headers replace the defaults;
+ HttpClient.decompress can turn decoding off
+
+A request with its own Host header went out with two (a 400 from S3 and
+MinIO, and a signed request signs the Host it sends), and User-Agent and
+Connection could not be replaced either. A header the caller gives now
+replaces the client's default. Over HTTP/2 a caller's Host and
+connection-specific headers are dropped (:authority says the same, and
+RFC 9113 8.2.2 forbids the rest).
+
+HttpClient.decompress = False sends no Accept-Encoding and returns
+bodies as sent, for callers that need Content-Length and Range to
+describe the bytes they receive (object stores).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo | 48 ++++++++++++++++++++++++++++++++++--------------
+ test_client.mojo | 43 +++++++++++++++++++++++++++++++++++++++++++
+ test_server.py   |  3 +++
+ 3 files changed, 80 insertions(+), 14 deletions(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index e8070ae..7217214 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -406,6 +406,7 @@ struct HttpClient(Movable):
+     var default_content_type: String    # Content-Type for a body sent without one ("" = send none)
+     var connections_opened: Int         # TCP connections this client has opened (pool reuse = fewer)
+     var max_response_bytes: Int         # largest body _do_request buffers (default 100 MB)
++    var decompress: Bool                # send Accept-Encoding and decode bodies (default True)
+     var _timeout_secs: Int              # socket send/recv timeout (seconds)
+ 
+     # CA bundle cache — loaded once on first HTTPS request
+@@ -473,6 +474,7 @@ struct HttpClient(Movable):
+         self.default_content_type = String("application/json")
+         self.connections_opened = 0
+         self.max_response_bytes = MAX_RESPONSE_BYTES
++        self.decompress = True
+         self._timeout_secs = timeout_secs
+         self._ca_bundle = List[X509Cert]()
+         self._ca_loaded = False
+@@ -529,6 +531,7 @@ struct HttpClient(Movable):
+         self.default_content_type = move.default_content_type^
+         self.connections_opened = move.connections_opened
+         self.max_response_bytes = move.max_response_bytes
++        self.decompress = move.decompress
+         self._timeout_secs = move._timeout_secs
+         self._ca_bundle = move._ca_bundle^
+         self._ca_loaded = move._ca_loaded
+@@ -942,17 +945,23 @@ struct HttpClient(Movable):
+         _append_str(req_buf, " ")
+         _append_str(req_buf, url.request_path())
+         _append_str(req_buf, " HTTP/1.1\r\n")
+-        _append_str(req_buf, "Host: ")
+-        _append_str(req_buf, url.host_header())
+-        _append_str(req_buf, "\r\n")
+-        _append_str(req_buf, "User-Agent: ")
+-        _append_str(req_buf, self.user_agent)
+-        _append_str(req_buf, "\r\n")
++        # A header the caller gives replaces the client's default rather than
++        # adding a second one: two Host headers are a 400 (RFC 9112 3.2), and
++        # a signed request (AWS SigV4) signs the Host it sends itself.
++        if not extra_headers.has("Host"):
++            _append_str(req_buf, "Host: ")
++            _append_str(req_buf, url.host_header())
++            _append_str(req_buf, "\r\n")
++        if not extra_headers.has("User-Agent"):
++            _append_str(req_buf, "User-Agent: ")
++            _append_str(req_buf, self.user_agent)
++            _append_str(req_buf, "\r\n")
+         if not extra_headers.has("Accept"):
+             _append_str(req_buf, "Accept: */*\r\n")
+-        if not extra_headers.has("Accept-Encoding"):
++        if self.decompress and not extra_headers.has("Accept-Encoding"):
+             _append_str(req_buf, "Accept-Encoding: " + self._accept_encoding() + "\r\n")
+-        _append_str(req_buf, "Connection: keep-alive\r\n")
++        if not extra_headers.has("Connection"):
++            _append_str(req_buf, "Connection: keep-alive\r\n")
+ 
+         # Add Content-Length and Content-Type for non-empty bodies
+         if body.byte_length() > 0:
+@@ -1202,7 +1211,7 @@ struct HttpClient(Movable):
+         # Phase 14: use _ptr variants — decompress directly from the body's
+         # internal byte buffer without an intermediate List[UInt8] copy.
+         var ce = parsed.headers.get("Content-Encoding")
+-        if ce.byte_length() > 0:
++        if self.decompress and ce.byte_length() > 0:
+             var body_bytes = parsed.body.as_bytes()
+             var decoded = self._decode_body(ce, Int(body_bytes.unsafe_ptr()), len(body_bytes))
+             if decoded:
+@@ -1401,15 +1410,16 @@ struct HttpClient(Movable):
+         # :authority — host:port equivalent in HTTP/2
+         h2_hdrs.append(HpackHeader(":authority", url.host_header()))
+ 
+-        # user-agent
+-        h2_hdrs.append(HpackHeader("user-agent", self.user_agent))
++        # user-agent (unless caller overrides)
++        if not extra_headers.has("User-Agent"):
++            h2_hdrs.append(HpackHeader("user-agent", self.user_agent))
+ 
+         # accept (unless caller overrides)
+         if not extra_headers.has("Accept"):
+             h2_hdrs.append(HpackHeader("accept", "*/*"))
+ 
+         # accept-encoding (unless caller overrides)
+-        if not extra_headers.has("Accept-Encoding"):
++        if self.decompress and not extra_headers.has("Accept-Encoding"):
+             h2_hdrs.append(HpackHeader("accept-encoding", self._accept_encoding()))
+ 
+         # content-length and content-type for non-empty bodies
+@@ -1443,7 +1453,17 @@ struct HttpClient(Movable):
+                     low.append(b + 32)
+                 else:
+                     low.append(b)
+-            h2_hdrs.append(HpackHeader(String(unsafe_from_utf8=low), extra_headers._values[i]))
++            var name = String(unsafe_from_utf8=low)
++            # :authority already says what Host would, and HTTP/2 forbids
++            # connection-specific fields (RFC 9113 8.2.2): a caller's
++            # HTTP/1.1-style headers must not reset the stream.
++            if (
++                name == "host" or name == "connection" or name == "keep-alive"
++                or name == "proxy-connection" or name == "transfer-encoding"
++                or name == "upgrade"
++            ):
++                continue
++            h2_hdrs.append(HpackHeader(name, extra_headers._values[i]))
+ 
+         # ── Call h2_do_request on the correct pool slot ───────────────────
+         var result: Tuple[Int, List[HpackHeader], List[UInt8]]
+@@ -1477,7 +1497,7 @@ struct HttpClient(Movable):
+         # HTTP/2 headers are lowercase; use case-insensitive compare.
+         # Convert resp_body → String first so as_bytes().unsafe_ptr() matches
+         # the proven H1 decompression path exactly.
+-        var ce = resp.headers.get("content-encoding")
++        var ce = resp.headers.get("content-encoding") if self.decompress else String("")
+         if ce.byte_length() > 0:
+             var body_str   = String(unsafe_from_utf8=resp_body)
+             var body_bytes = body_str.as_bytes()
+diff --git a/test_client.mojo b/test_client.mojo
+index d8b3619..1adddee 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1364,6 +1364,47 @@ def test_brotli_body_larger_than_8x() raises:
+     )
+ 
+ 
++def _count_header(lines: JsonValue, name: String) raises -> Int:
++    var n = 0
++    for i in range(len(lines)):
++        var line = lines[i].as_string()
++        if line.lower().startswith(name.lower() + ":"):
++            n += 1
++    return n
++
++
++def test_caller_headers_replace_defaults() raises:
++    """A caller's Host or User-Agent replaces the client's, not doubles it."""
++    var client = HttpClient(allow_private_ips=True)
++    var headers = HttpHeaders()
++    headers.add("Host", "127.0.0.1:18080")
++    headers.add("User-Agent", "custom-agent/1.0")
++    headers.add("Connection", "keep-alive")
++    var data = client.get(BASE + "/headers-raw", headers).json()
++    var lines = data["lines"].copy()
++    assert_eq(_count_header(lines, "Host"), 1, "one Host")
++    assert_eq(_count_header(lines, "User-Agent"), 1, "one User-Agent")
++    assert_eq(_count_header(lines, "Connection"), 1, "one Connection")
++    var found = False
++    for i in range(len(lines)):
++        if lines[i].as_string() == "User-Agent: custom-agent/1.0":
++            found = True
++    assert_true(found, "the caller's User-Agent was sent")
++
++
++def test_decompress_off() raises:
++    """decompress=False: no Accept-Encoding, and an encoded body is left as
++    sent (byte ranges and Content-Length then describe the same bytes)."""
++    var client = HttpClient(allow_private_ips=True)
++    client.decompress = False
++    var lines = client.get(BASE + "/headers-raw").json()["lines"].copy()
++    assert_eq(_count_header(lines, "Accept-Encoding"), 0, "no Accept-Encoding")
++    var resp = client.get(BASE + "/gzip")
++    assert_str_eq(resp.headers.get("Content-Encoding"), "gzip", "still encoded")
++    var raw = resp.body.as_bytes()
++    assert_true(len(raw) > 2 and raw[0] == 0x1F and raw[1] == 0x8B, "gzip magic kept")
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1588,6 +1629,8 @@ def main() raises:
+     print()
+ 
+     run_test[test_get_root]("GET /", passed, failed)
++    run_test[test_caller_headers_replace_defaults]("caller headers replace defaults", passed, failed)
++    run_test[test_decompress_off]("decompress off", passed, failed)
+     run_test[test_chunked_when_transfer_encoding_is_the_last_header]("chunked with Transfer-Encoding last", passed, failed)
+     run_test[test_content_length_header_name_must_match_exactly]("Content-Length matched as a header name only", passed, failed)
+     run_test[test_no_content_does_not_wait_for_a_body]("204/304 without Content-Length", passed, failed)
+diff --git a/test_server.py b/test_server.py
+index ecd3fc8..763869c 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -22,6 +22,9 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+             self._respond(404, "Not Found", {"error": "not found"})
+         elif self.path == "/status/500":
+             self._respond(500, "Internal Server Error", {"error": "server error"})
++        elif self.path == "/headers-raw":
++            # Every request header line as received, duplicates included.
++            self._respond(200, "OK", {"lines": ["%s: %s" % kv for kv in self.headers.items()]})
+         elif self.path == "/headers":
+             # Echo back all request headers
+             headers = {}
+-- 
+2.55.0
+

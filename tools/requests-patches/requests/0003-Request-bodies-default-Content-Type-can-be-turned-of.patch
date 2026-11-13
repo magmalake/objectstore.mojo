@@ -1,0 +1,141 @@
+From f383b786f03718566e0cfd150afc5cefbb47a8f4 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:24:04 -0800
+Subject: [PATCH 3/9] Request bodies: default Content-Type can be turned off;
+ empty PUT/POST/PATCH send Content-Length: 0
+
+HttpClient.default_content_type (still "application/json" by default)
+is the Content-Type given to a body sent without one; "" sends none.
+Object stores keep the request's Content-Type as the object's, so a
+binary upload was stored as application/json.
+
+An empty POST, PUT or PATCH went out with no Content-Length at all,
+which RFC 9110 8.6 asks for and S3 requires (411 Length Required).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo | 22 ++++++++++++++++++----
+ test_client.mojo | 26 ++++++++++++++++++++++++++
+ test_server.py   |  1 +
+ 3 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index a450a81..63ee989 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -403,6 +403,7 @@ struct HttpClient(Movable):
+     var redirect_same_host_only: Bool   # if True, stop following cross-host redirects
+     var pool_idle_timeout_secs: Int     # evict pool connections idle longer than this (default 300)
+     var proxy_url: String               # HTTP proxy URL, e.g. "http://host:port" (empty = no proxy)
++    var default_content_type: String    # Content-Type for a body sent without one ("" = send none)
+     var _timeout_secs: Int              # socket send/recv timeout (seconds)
+ 
+     # CA bundle cache — loaded once on first HTTPS request
+@@ -467,6 +468,7 @@ struct HttpClient(Movable):
+         self.redirect_same_host_only = False
+         self.pool_idle_timeout_secs = 300
+         self.proxy_url = String("")
++        self.default_content_type = String("application/json")
+         self._timeout_secs = timeout_secs
+         self._ca_bundle = List[X509Cert]()
+         self._ca_loaded = False
+@@ -520,6 +522,7 @@ struct HttpClient(Movable):
+         self.redirect_same_host_only = move.redirect_same_host_only
+         self.pool_idle_timeout_secs = move.pool_idle_timeout_secs
+         self.proxy_url = move.proxy_url^
++        self.default_content_type = move.default_content_type^
+         self._timeout_secs = move._timeout_secs
+         self._ca_bundle = move._ca_bundle^
+         self._ca_loaded = move._ca_loaded
+@@ -948,8 +951,16 @@ struct HttpClient(Movable):
+             _append_str(req_buf, "Content-Length: ")
+             _append_str(req_buf, String(body.byte_length()))
+             _append_str(req_buf, "\r\n")
+-            if not extra_headers.has("Content-Type"):
+-                _append_str(req_buf, "Content-Type: application/json\r\n")
++            if (
++                not extra_headers.has("Content-Type")
++                and self.default_content_type.byte_length() > 0
++            ):
++                _append_str(req_buf, "Content-Type: " + self.default_content_type + "\r\n")
++        elif method == "POST" or method == "PUT" or method == "PATCH":
++            # These methods define a meaning for a body, so an empty one is
++            # still announced (RFC 9110 8.6); S3 and others answer a PUT
++            # without Content-Length with 411 Length Required.
++            _append_str(req_buf, "Content-Length: 0\r\n")
+ 
+         # Auto-send cookies from jar for this host
+         var jar_cookie = self._jar_cookie_for(url.host, url.request_path(), url.scheme == "https")
+@@ -1400,8 +1411,11 @@ struct HttpClient(Movable):
+             for i in range(len(bb)):
+                 body_bytes.append(bb[i])
+             h2_hdrs.append(HpackHeader("content-length", String(len(body_bytes))))
+-            if not extra_headers.has("Content-Type"):
+-                h2_hdrs.append(HpackHeader("content-type", "application/json"))
++            if (
++                not extra_headers.has("Content-Type")
++                and self.default_content_type.byte_length() > 0
++            ):
++                h2_hdrs.append(HpackHeader("content-type", self.default_content_type))
+ 
+         # cookies from jar
+         var jar_cookie = self._jar_cookie_for(
+diff --git a/test_client.mojo b/test_client.mojo
+index b6df582..2068e77 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -1309,6 +1309,30 @@ def test_interim_100_continue_skipped() raises:
+     assert_str_eq(resp.body, "ok", "final body")
+ 
+ 
++def test_default_content_type_can_be_turned_off() raises:
++    """With default_content_type = "", a body goes out with no Content-Type
++    (an object store would otherwise store "application/json" for it)."""
++    var client = HttpClient(allow_private_ips=True)
++    client.default_content_type = ""
++    var data = client.put(BASE + "/echo", "raw bytes").json()
++    assert_str_eq(data["content_type"].as_string(), "", "no content-type sent")
++    var headers = HttpHeaders()
++    headers.add("Content-Type", "text/plain")
++    var data2 = client.put(BASE + "/echo", "raw bytes", headers).json()
++    assert_str_eq(data2["content_type"].as_string(), "text/plain", "caller's content-type")
++
++
++def test_empty_put_sends_content_length_zero() raises:
++    """An empty PUT/POST still says Content-Length: 0 (RFC 9110 8.6)."""
++    var client = HttpClient(allow_private_ips=True)
++    var put = client.put(BASE + "/echo", "").json()
++    assert_str_eq(put["content_length"].as_string(), "0", "PUT content-length")
++    var post = client.post(BASE + "/echo", "").json()
++    assert_str_eq(post["content_length"].as_string(), "0", "POST content-length")
++    var dele = client.delete(BASE + "/echo").json()
++    assert_str_eq(dele["content_length"].as_string(), "", "DELETE sends none")
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1507,6 +1531,8 @@ def main() raises:
+     run_test[test_content_length_header_name_must_match_exactly]("Content-Length matched as a header name only", passed, failed)
+     run_test[test_no_content_does_not_wait_for_a_body]("204/304 without Content-Length", passed, failed)
+     run_test[test_interim_100_continue_skipped]("100 Continue skipped", passed, failed)
++    run_test[test_default_content_type_can_be_turned_off]("default Content-Type can be turned off", passed, failed)
++    run_test[test_empty_put_sends_content_length_zero]("empty PUT/POST sends Content-Length: 0", passed, failed)
+     run_test[test_status_200]("status 200", passed, failed)
+     run_test[test_status_404]("status 404", passed, failed)
+     run_test[test_status_500]("status 500", passed, failed)
+diff --git a/test_server.py b/test_server.py
+index 0b372a0..185a718 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -395,6 +395,7 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+             "method": self.command,
+             "body": body,
+             "content_type": content_type,
++            "content_length": self.headers.get("Content-Length", ""),
+         })
+ 
+     def _handle_method(self):
+-- 
+2.55.0
+

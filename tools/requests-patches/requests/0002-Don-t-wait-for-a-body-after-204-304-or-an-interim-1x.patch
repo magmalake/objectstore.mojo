@@ -1,0 +1,216 @@
+From b3108af314e513bda76e443ca3458eaaca615bd2 Mon Sep 17 00:00:00 2001
+From: Marius S <39998+winding-lines@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 07:22:15 -0800
+Subject: [PATCH 2/9] Don't wait for a body after 204, 304 or an interim 1xx
+
+A 204 or 304 without Content-Length on a keep-alive connection fell into
+the read-until-close branch and waited for the read timeout (S3 answers
+DELETE this way), and a 100 Continue was returned as the response. Both
+now follow RFC 9112 6.3: 1xx responses are skipped, 204 and 304 end at
+the headers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ http_client.mojo | 76 +++++++++++++++++++++++++++++++++++-------------
+ test_client.mojo | 25 ++++++++++++++++
+ test_server.py   | 20 +++++++++++++
+ 3 files changed, 101 insertions(+), 20 deletions(-)
+
+diff --git a/http_client.mojo b/http_client.mojo
+index 87181e5..a450a81 100644
+--- a/http_client.mojo
++++ b/http_client.mojo
+@@ -2182,6 +2182,20 @@ def _buf_chunked_complete(buf: List[UInt8], start: Int) -> Bool:
+         pos = pos + chunk_size + 2  # skip data + \r\n
+ 
+ 
++def _buf_status_code(buf: List[UInt8]) -> Int:
++    """The status code of the response at the start of buf ("HTTP/1.1 204 ..."),
++    or 0 if the status line is malformed (the parser reports that later)."""
++    if len(buf) < 12 or buf[8] != 32:
++        return 0
++    var code = 0
++    for i in range(9, 12):
++        var c = buf[i]
++        if c < 48 or c > 57:
++            return 0
++        code = code * 10 + Int(c - 48)
++    return code
++
++
+ def _lc(b: UInt8) -> UInt8:
+     """Convert a byte to lowercase (ASCII A-Z only)."""
+     if b >= 65 and b <= 90:
+@@ -2330,19 +2344,30 @@ def _recv_tls_keepalive(
+     """
+     var buf = List[UInt8]()
+ 
+-    # Phase 1: read until headers complete
++    # Phase 1: read until headers complete. An interim 1xx response (100
++    # Continue, 103 Early Hints) has no body and precedes the real one: drop
++    # it and read on.
+     var header_end = -1
+-    while header_end < 0:
+-        var chunk = sock.recv(4096)
+-        if len(chunk) == 0:
+-            raise _err_connection("connection closed before response headers")
+-        _list_append(buf, chunk)
+-        if len(buf) > MAX_RESPONSE_BYTES:
+-            raise _err_connection("response headers exceed size limit")
++    var status = 0
++    while True:
++        while header_end < 0:
++            var chunk = sock.recv(4096)
++            if len(chunk) == 0:
++                raise _err_connection("connection closed before response headers")
++            _list_append(buf, chunk)
++            if len(buf) > MAX_RESPONSE_BYTES:
++                raise _err_connection("response headers exceed size limit")
++            header_end = _buf_find_crlf_crlf(buf)
++        status = _buf_status_code(buf)
++        if status < 100 or status >= 200 or status == 101:
++            break
++        buf = _buf_leftover(buf, header_end + 4)
+         header_end = _buf_find_crlf_crlf(buf)
+ 
+-    # HEAD response: no body — return headers only
+-    if skip_body:
++    # HEAD, 204 and 304 responses never have a body (RFC 9112 §6.3): return
++    # the headers only. Reading on would wait for a body that never comes
++    # and, on a keep-alive connection, hang until the read timeout.
++    if skip_body or status == 204 or status == 304:
+         var headers_only = List[UInt8](capacity=header_end + 4)
+         for i in range(header_end + 4):
+             headers_only.append(buf[i])
+@@ -2406,19 +2431,30 @@ def _recv_http_keepalive(
+     """
+     var buf = List[UInt8]()
+ 
+-    # Phase 1: read until headers complete
++    # Phase 1: read until headers complete. An interim 1xx response (100
++    # Continue, 103 Early Hints) has no body and precedes the real one: drop
++    # it and read on.
+     var header_end = -1
+-    while header_end < 0:
+-        var chunk = sock.recv_bytes(4096)
+-        if len(chunk) == 0:
+-            raise _err_connection("connection closed before response headers")
+-        _list_append(buf, chunk)
+-        if len(buf) > MAX_RESPONSE_BYTES:
+-            raise _err_connection("response headers exceed size limit")
++    var status = 0
++    while True:
++        while header_end < 0:
++            var chunk = sock.recv_bytes(4096)
++            if len(chunk) == 0:
++                raise _err_connection("connection closed before response headers")
++            _list_append(buf, chunk)
++            if len(buf) > MAX_RESPONSE_BYTES:
++                raise _err_connection("response headers exceed size limit")
++            header_end = _buf_find_crlf_crlf(buf)
++        status = _buf_status_code(buf)
++        if status < 100 or status >= 200 or status == 101:
++            break
++        buf = _buf_leftover(buf, header_end + 4)
+         header_end = _buf_find_crlf_crlf(buf)
+ 
+-    # HEAD response: no body — return headers only
+-    if skip_body:
++    # HEAD, 204 and 304 responses never have a body (RFC 9112 §6.3): return
++    # the headers only. Reading on would wait for a body that never comes
++    # and, on a keep-alive connection, hang until the read timeout.
++    if skip_body or status == 204 or status == 304:
+         var headers_only = List[UInt8](capacity=header_end + 4)
+         for i in range(header_end + 4):
+             headers_only.append(buf[i])
+diff --git a/test_client.mojo b/test_client.mojo
+index 94985fa..b6df582 100644
+--- a/test_client.mojo
++++ b/test_client.mojo
+@@ -10,6 +10,7 @@
+ from http_client import HttpClient, HttpHeaders, HttpResponse, BasicAuth, BearerAuth, StreamResponse, Session
+ from json import JsonValue
+ from codecs import Codecs, accept_encoding
++from http_client import _unix_time_secs
+ 
+ 
+ # ============================================================================
+@@ -1286,6 +1287,28 @@ def test_content_length_header_name_must_match_exactly() raises:
+     assert_str_eq(resp.headers.get("X-Amz-Meta-Content-Length"), "5", "metadata header kept")
+ 
+ 
++def test_no_content_does_not_wait_for_a_body() raises:
++    """204 and 304 have no body even without Content-Length (RFC 9112 6.3)."""
++    var client = HttpClient(allow_private_ips=True, timeout_secs=5)
++    var t0 = _unix_time_secs()
++    var r204 = client.get(BASE + "/no-content")
++    assert_eq(r204.status_code, 204, "204 status")
++    assert_eq(r204.body.byte_length(), 0, "204 body")
++    assert_true(_unix_time_secs() - t0 < 3, "answered without waiting for the timeout")
++    # (test_server.py is single-threaded: this one waits for it to finish
++    # holding the first connection, so it is not timed.)
++    var r304 = client.get(BASE + "/not-modified")
++    assert_eq(r304.status_code, 304, "304 status")
++
++
++def test_interim_100_continue_skipped() raises:
++    """A 100 Continue before the final response is not the response."""
++    var client = HttpClient(allow_private_ips=True, timeout_secs=5)
++    var resp = client.get(BASE + "/continue-then-ok")
++    assert_eq(resp.status_code, 200, "final status")
++    assert_str_eq(resp.body, "ok", "final body")
++
++
+ def test_content_length_over_limit() raises:
+     """Content-Length exceeding the 100 MB limit should raise before reading body.
+ 
+@@ -1482,6 +1505,8 @@ def main() raises:
+ 
+     run_test[test_get_root]("GET /", passed, failed)
+     run_test[test_content_length_header_name_must_match_exactly]("Content-Length matched as a header name only", passed, failed)
++    run_test[test_no_content_does_not_wait_for_a_body]("204/304 without Content-Length", passed, failed)
++    run_test[test_interim_100_continue_skipped]("100 Continue skipped", passed, failed)
+     run_test[test_status_200]("status 200", passed, failed)
+     run_test[test_status_404]("status 404", passed, failed)
+     run_test[test_status_500]("status 500", passed, failed)
+diff --git a/test_server.py b/test_server.py
+index 4a104c0..0b372a0 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -7,6 +7,7 @@ Usage: python test_server.py
+ """
+ 
+ import http.server
++import time
+ import json
+ import sys
+ 
+@@ -61,6 +62,25 @@ class TestHandler(http.server.BaseHTTPRequestHandler):
+             self._respond(200, "OK", {"query": query})
+         elif self.path == "/method":
+             self._respond(200, "OK", {"method": "GET"})
++        elif self.path in ("/no-content", "/not-modified"):
++            # HTTP/1.1 keep-alive and no Content-Length, as S3 answers a
++            # DELETE: the client must not wait for a body.
++            self.protocol_version = "HTTP/1.1"
++            self.send_response(204 if self.path == "/no-content" else 304)
++            self.send_header("ETag", '"abc"')
++            self.end_headers()
++            self.wfile.flush()
++            # Hold the connection open like a keep-alive server would; a
++            # client waiting for a body sees nothing until this returns.
++            time.sleep(4)
++        elif self.path == "/continue-then-ok":
++            self.protocol_version = "HTTP/1.1"
++            self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
++            self.send_response(200)
++            self.send_header("Content-Length", "2")
++            self.send_header("Connection", "close")
++            self.end_headers()
++            self.wfile.write(b"ok")
+         elif self.path == "/meta-content-length":
+             # A header whose name *ends* in Content-Length, sent first, with a
+             # body too large to arrive in the first read.
+-- 
+2.55.0
+

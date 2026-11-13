@@ -17,6 +17,7 @@ Routes:
   /status/<code>  answers with that status and a short body
   /slow?ms=N      sleeps N milliseconds first (timeout tests)
   /noclen         a chunked response, so Content-Length is absent
+  /attempts/reset forgets the /flaky/ counts
   /ports          "count=N": distinct client ports seen since the last reset,
                   which is how the connection-reuse test observes that N
                   requests rode one TCP connection
@@ -130,6 +131,13 @@ class Handler(BaseHTTPRequestHandler):
                 )).encode("ascii"),
                 "text/plain",
             )
+
+        if path == "/attempts/reset":
+            # The suite runs twice against one server (libcurl, then the
+            # requests backend); the second run starts from zero.
+            with STATE_LOCK:
+                ATTEMPTS.clear()
+            return self._send(200, b"reset\n", "text/plain")
 
         if path == "/attempts":
             with STATE_LOCK:
