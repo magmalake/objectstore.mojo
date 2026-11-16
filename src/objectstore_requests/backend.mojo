@@ -9,10 +9,14 @@ What maps to what:
 |                          | client (each keeps its own keep-alive sockets)   |
 | `new_connection_pool`    | one dedicated client                             |
 | `pool_stats`             | requests made, `connections_opened` deltas       |
-| `request_many`           | sequential on one client: requests has no multi  |
-|                          | interface, so ranges are not in flight together  |
+| `request_many`           | sequential on one client. requests' `get_many`   |
+|                          | multiplexes only over HTTP/2 and sends one set   |
+|                          | of headers for every URL, so it cannot carry a   |
+|                          | SigV4 signature per range: ranges are not in     |
+|                          | flight together                                  |
 | `timeout_ms`             | `timeout_secs`, rounded up; it bounds each socket |
-|                          | read and write, not the whole request            |
+|                          | read and write, not the whole request (requests' |
+|                          | `total_timeout_secs` is whole seconds only)      |
 | `verify_tls=False`       | refused: tls has no way to skip verification     |
 | `follow_redirects`       | `follow_redirects`, at most 5 hops               |
 | the SigV4 clock          | `time()` through requests                        |
@@ -49,7 +53,8 @@ from objectstore.http import (
 comptime _USER_AGENT = "objectstore.mojo/0.2 (requests)"
 comptime _MAX_BODY = 1 << 40
 """requests buffers a whole response; its default 100 MB cap is per client,
-and an object store's objects are routinely larger."""
+and an object store's objects are routinely larger. (A chunked body is still
+held to 100 MB in v1.11.0: tests/requests_gaps_test.mojo.)"""
 
 
 struct _Client(Movable):
@@ -336,7 +341,9 @@ def _epoch_now() raises -> Int:
 
 
 def _version() raises -> String:
-    return String("requests (Mosaad-M/requests, pure-Mojo HTTP/1.1 + tls)")
+    return String(
+        "requests (Mosaad-M/requests v1.11.0, pure-Mojo HTTP/1.1 + tls v1.11.0)"
+    )
 
 
 def _iso8601_epoch(s: String) -> Int:

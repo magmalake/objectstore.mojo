@@ -169,5 +169,20 @@ if [ -n "$DEPS" ]; then
         -I "$DEPS/json" -o build/requests-backend-test || exit 1
     echo "== running tests on the requests backend"
     ./build/requests-backend-test || STATUS=1
+    # Behaviour still missing upstream, each a test that fails today
+    # (tests/requests_gaps_test.mojo). Reported, never fatal: the run's
+    # status is the suite's. A gap that passes has been fixed upstream.
+    echo "== known upstream gaps (expected to fail until fixed upstream)"
+    if mojo build tests/requests_gaps_test.mojo -I src -I tests \
+        -I "$DEPS/requests" -I "$DEPS/tls" -I "$DEPS/tcp" -I "$DEPS/url" \
+        -I "$DEPS/json" -o build/requests-gaps-test; then
+        if ./build/requests-gaps-test; then
+            echo "== every known gap now passes: move them into objectstore_test"
+        else
+            echo "== known gaps still open (see tests/requests_gaps_test.mojo)"
+        fi
+    else
+        echo "== the gaps test did not build"
+    fi
 fi
 exit $STATUS

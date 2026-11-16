@@ -17,6 +17,7 @@ Routes:
   /status/<code>  answers with that status and a short body
   /slow?ms=N      sleeps N milliseconds first (timeout tests)
   /noclen         a chunked response, so Content-Length is absent
+  /bigchunked/<n> n bytes of 'x', chunked in 1 MiB chunks (no Content-Length)
   /attempts/reset forgets the /flaky/ counts
   /ports          "count=N": distinct client ports seen since the last reset,
                   which is how the connection-reuse test observes that N
@@ -161,6 +162,21 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(b"5\r\nchunk\r\n0\r\n\r\n")
+            return
+
+        if path.startswith("/bigchunked/"):
+            n = int(path.rsplit("/", 1)[1])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            if self.command != "HEAD":
+                block = b"x" * (1 << 20)
+                while n > 0:
+                    k = min(n, len(block))
+                    self.wfile.write(b"%x\r\n" % k + block[:k] + b"\r\n")
+                    n -= k
+                self.wfile.write(b"0\r\n\r\n")
             return
 
         if path == "/headers-last":
