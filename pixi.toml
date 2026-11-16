@@ -41,6 +41,9 @@ minio-server = ">=2025.10.15"
 # The dlopen test runs twice, the second time with CONDA_PREFIX unset: the
 # shim must then be found through the binary's rpath, as from a plain shell.
 test = { cmd = "bash tests/run_tests.sh && mojo build tests/dlopen_test.mojo -I src -o build/dlopen-test && ./build/dlopen-test && env -u CONDA_PREFIX ./build/dlopen-test" }
+# The same tests twice: on libcurl, then on the pure-Mojo requests backend
+# (objectstore#24), whose sources tools/fetch_requests.sh pins into .deps/.
+test-requests = { cmd = "bash tools/fetch_requests.sh && OBJECTSTORE_REQUESTS_DEPS=$PIXI_PROJECT_ROOT/.deps bash tests/run_tests.sh" }
 # Tests plus a CLI build, so a broken CLI fails CI too.
 check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/objectstore-mojo" }

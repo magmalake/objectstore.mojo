@@ -1621,7 +1621,9 @@ def _assert_only_signed_headers(report: String, what: String) raises:
             name == "authorization"
             or name == "content-length"
             or name == "user-agent"
-            or name == "accept",
+            or name == "accept"
+            # Hop-by-hop, so never signed; the requests backend sends it.
+            or name == "connection",
             what + " sent unsigned header '" + name + "': " + report,
         )
 

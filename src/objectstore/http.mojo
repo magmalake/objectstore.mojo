@@ -41,6 +41,15 @@ first bytes, so overlapping the waits is most of the speed there is to have.
 backoff and jitter, but only for requests that can safely be repeated — see
 `RetryPolicy`. A response that is *returned* is never retried behind the
 caller's back on a method the server might have already acted on.
+
+**Other transports.** libcurl is the default and needs nothing. A program
+can install another transport once, before its first request, with
+`install_backend`: then requests, batches, pools, their stats, the clock
+SigV4 signs with and the instance-role lookup all go through it, and the
+shim is never loaded. `objectstore_requests.install()` is one, over the
+pure-Mojo `requests` package (objectstore#24). It is a separate package
+because Mojo resolves every import at build time: importing it is the build
+switch, and a build that doesn't import it never needs `requests`.
 """
 
 from std.ffi import _Global, OwnedDLHandle, c_int, c_long, c_long_long, c_size_t
@@ -58,6 +67,85 @@ without opening sockets by the hundred."""
 comptime DEFAULT_TIMEOUT_MS = 30000
 """Total request deadline. Range reads of a Parquet footer are small; a 20 MB
 object over a slow link is not, so this is generous rather than tight."""
+
+
+# ---------------------------------------------------------------------------
+# Pluggable transport
+# ---------------------------------------------------------------------------
+
+comptime RequestFn = def(
+    Int, String, String, List[Header], Int, Int, Int, Int, Int, Bool, Bool
+) thin raises -> Response
+"""`(pool, method, url, headers, body_addr, body_len, range_start, range_end,
+timeout_ms, follow_redirects, verify_tls)`: one request, no retries (the
+caller retries). Raises on transport failure only."""
+comptime BatchFn = def(List[BatchRequest], Int, Bool, Int) thin raises -> List[
+    Optional[Response]
+]
+"""`(requests, timeout_ms, verify_tls, max_parallel)`: `None` for a request
+that failed in transport."""
+comptime PoolNewFn = def() thin raises -> Int
+comptime PoolFn = def(Int) thin raises -> None
+comptime StatsFn = def(Int) thin raises -> Tuple[Int, Int]
+comptime EpochFn = def() thin raises -> Int
+comptime TextFn = def() thin raises -> String
+
+comptime BATCH_POOL = -1
+"""Passed to a backend's `stats`/`reset_stats` for the batch counters."""
+
+
+@fieldwise_init
+struct HttpBackend(Copyable, Movable):
+    """A transport other than the libcurl shim: see `install_backend`."""
+
+    var name: String
+    var request: RequestFn
+    var request_many: BatchFn
+    var pool_new: PoolNewFn
+    var pool_free: PoolFn
+    var stats: StatsFn
+    """`(requests, connections)` for a pool, or for batches (`BATCH_POOL`)."""
+    var reset_stats: PoolFn
+    var epoch_now: EpochFn
+    """Seconds since the Unix epoch, for SigV4."""
+    var instance_credentials: TextFn
+    """As `instance_credentials_blob`."""
+    var version: TextFn
+
+
+struct _BackendSlot(Movable):
+    var backend: Optional[HttpBackend]
+
+    def __init__(out self):
+        self.backend = None
+
+
+def _no_backend() -> _BackendSlot:
+    return _BackendSlot()
+
+
+comptime _BACKEND = _Global["objectstore_http_backend", _no_backend]
+
+
+def install_backend(var backend: HttpBackend) raises:
+    """Routes every request of this process through `backend`.
+
+    Call it once, before the first request and before starting threads:
+    the slot is read without a lock.
+    """
+    _BACKEND.get_or_create_ptr()[].backend = backend^
+
+
+def _backend() raises -> ref[MutUntrackedOrigin] Optional[HttpBackend]:
+    return _BACKEND.get_or_create_ptr()[].backend
+
+
+def backend_name() raises -> String:
+    """`"libcurl"`, or the installed backend's name."""
+    ref b = _backend()
+    if b:
+        return b.value().name
+    return String("libcurl")
 
 
 struct _Shim(Movable):
@@ -146,6 +234,9 @@ def new_connection_pool() raises -> Int:
     because `HttpClient` is `Copyable`, and a copyable owner of a C resource
     is a double free waiting to happen. Most callers want `SHARED_POOL`.
     """
+    ref b = _backend()
+    if b:
+        return b.value().pool_new()
     ref lib = _lib()
     return _pool_new(lib)
 
@@ -161,6 +252,10 @@ def _pool_new(imm lib: OwnedDLHandle) raises -> Int:
 def free_connection_pool(pool: Int) raises:
     """Closes a pool from `new_connection_pool` and its live connections."""
     if pool == SHARED_POOL:
+        return
+    ref b = _backend()
+    if b:
+        b.value().pool_free(pool)
         return
     ref lib = _lib()
     _pool_free(lib, pool)
@@ -178,6 +273,9 @@ def pool_stats(pool: Int = SHARED_POOL) raises -> Tuple[Int, Int]:
     that it stays at 1 while `requests` climbs — which is how the tests prove
     it rather than inferring it from a stopwatch.
     """
+    ref b = _backend()
+    if b:
+        return b.value().stats(pool)
     ref lib = _lib()
     return _pool_stats(lib, pool)
 
@@ -189,6 +287,10 @@ def _pool_stats(imm lib: OwnedDLHandle, pool: Int) raises -> Tuple[Int, Int]:
 
 
 def reset_pool_stats(pool: Int = SHARED_POOL) raises:
+    ref b = _backend()
+    if b:
+        b.value().reset_stats(pool)
+        return
     ref lib = _lib()
     var reset_fn = lib.get_function[NoneType]("os_http_client_reset_stats")
     _ = reset_fn(pool)
@@ -197,7 +299,11 @@ def reset_pool_stats(pool: Int = SHARED_POOL) raises:
 def shim_abi() raises -> Int:
     """1 = a fresh curl handle per request (0.1.x); 2 = pooled connections;
     3 = `instance_credentials_blob`; 4 = batches (`request_many`); 5 = safe
-    from several threads."""
+    from several threads. An installed backend provides all of these, so it
+    answers 5 without loading the shim."""
+    ref b = _backend()
+    if b:
+        return 5
     ref lib = _lib()
     var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
     return Int(abi_fn())
@@ -212,6 +318,9 @@ def instance_credentials_blob() raises -> String:
     cheap to call per request. A shim older than ABI 3 has no lookup and
     answers `""` as well.
     """
+    ref b = _backend()
+    if b:
+        return b.value().instance_credentials()
     ref lib = _lib()
     return _instance_credentials(lib)
 
@@ -695,6 +804,9 @@ def _run_batch(
 def batch_stats() raises -> Tuple[Int, Int]:
     """`(requests, connections)` for batches since `reset_batch_stats`: the
     connections stay few while requests climb, because batches reuse them."""
+    ref b = _backend()
+    if b:
+        return b.value().stats(BATCH_POOL)
     ref lib = _lib()
     var req_fn = lib.get_function[c_long]("os_http_batch_requests")
     var con_fn = lib.get_function[c_long]("os_http_batch_connects")
@@ -702,6 +814,10 @@ def batch_stats() raises -> Tuple[Int, Int]:
 
 
 def reset_batch_stats() raises:
+    ref b = _backend()
+    if b:
+        b.value().reset_stats(BATCH_POOL)
+        return
     ref lib = _lib()
     var reset_fn = lib.get_function[NoneType]("os_http_batch_reset_stats")
     _ = reset_fn()
@@ -759,19 +875,8 @@ struct HttpClient(Copyable, Movable):
         var attempt = 0
         while True:
             try:
-                ref lib = _lib()
-                var resp = _do_request(
-                    lib,
-                    self.pool,
-                    method,
-                    url,
-                    blob,
-                    body,
-                    range_start,
-                    range_end,
-                    self.timeout_ms,
-                    self.follow_redirects,
-                    self.verify_tls,
+                var resp = self._send(
+                    method, url, headers, blob, body, range_start, range_end
                 )
                 if attempt >= self.retry.max_retries or not repeatable:
                     return resp^
@@ -792,6 +897,57 @@ struct HttpClient(Copyable, Movable):
                 attempt += 1
                 sleep(Float64(backoff_delay_ms(self.retry, attempt)) / 1000.0)
 
+    def _send(
+        self,
+        method: String,
+        url: String,
+        headers: List[Header],
+        blob: String,
+        body: Span[UInt8, _],
+        range_start: Int,
+        range_end: Int,
+    ) raises -> Response:
+        """One attempt, on the installed backend or the shim."""
+        ref b = _backend()
+        if b:
+            try:
+                return b.value().request(
+                    self.pool,
+                    method,
+                    url,
+                    headers,
+                    Int(body.unsafe_ptr()) if len(body) > 0 else 0,
+                    len(body),
+                    range_start,
+                    range_end,
+                    self.timeout_ms,
+                    self.follow_redirects,
+                    self.verify_tls,
+                )
+            except e:
+                raise Error(
+                    "objectstore.http: "
+                    + method
+                    + " "
+                    + url
+                    + " failed: "
+                    + String(e)
+                )
+        ref lib = _lib()
+        return _do_request(
+            lib,
+            self.pool,
+            method,
+            url,
+            blob,
+            body,
+            range_start,
+            range_end,
+            self.timeout_ms,
+            self.follow_redirects,
+            self.verify_tls,
+        )
+
     def request_many(
         self,
         reqs: List[BatchRequest],
@@ -808,9 +964,7 @@ struct HttpClient(Copyable, Movable):
         var out = List[Response](capacity=len(reqs))
         if len(reqs) == 0:
             return out^
-        ref lib = _lib()
-        var abi_fn = lib.get_function[c_long]("os_http_shim_abi")
-        if Int(abi_fn()) < 4 or len(reqs) == 1:
+        if shim_abi() < 4 or len(reqs) == 1:
             for k in range(len(reqs)):
                 ref r = reqs[k]
                 out.append(
@@ -824,9 +978,17 @@ struct HttpClient(Copyable, Movable):
                     )
                 )
             return out^
-        var got = _run_batch(
-            lib, reqs, self.timeout_ms, self.verify_tls, max_parallel
-        )
+        var got: List[Optional[Response]]
+        ref b = _backend()
+        if b:
+            got = b.value().request_many(
+                reqs, self.timeout_ms, self.verify_tls, max_parallel
+            )
+        else:
+            ref lib = _lib()
+            got = _run_batch(
+                lib, reqs, self.timeout_ms, self.verify_tls, max_parallel
+            )
         for k in range(len(reqs)):
             var again = True
             if got[k]:
@@ -895,7 +1057,11 @@ struct HttpClient(Copyable, Movable):
 
 
 def curl_version() raises -> String:
-    """Libcurl's own version banner, e.g. `libcurl/8.9.1 OpenSSL/3.3.1 …`."""
+    """Libcurl's own version banner, e.g. `libcurl/8.9.1 OpenSSL/3.3.1 …`, or
+    the installed backend's."""
+    ref b = _backend()
+    if b:
+        return b.value().version()
     ref lib = _lib()
     return _do_curl_version(lib)
 
