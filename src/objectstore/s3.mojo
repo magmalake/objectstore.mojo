@@ -37,7 +37,7 @@ from .http import (
     Response,
     instance_credentials_blob,
 )
-from .path import Uri, parse_uri, url_encode
+from .path import parse_uri, url_encode
 from .sigv4 import (
     AmzTime,
     EMPTY_SHA256,

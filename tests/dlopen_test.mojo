@@ -8,7 +8,6 @@ missing one raises a clear Error rather than aborting.
 
 from std.os import getenv
 from std.os.path import dirname
-from std.sys import CompilationTarget
 from std.testing import assert_equal, assert_true, TestSuite
 from objectstore.http import shim_abi
 from objectstore._dlopen import executable_dir, library_candidates, open_library

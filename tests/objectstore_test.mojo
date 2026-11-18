@@ -7,7 +7,7 @@ addressing) runs unconditionally and needs no network at all.
 """
 
 from std.collections import Dict
-from std.os import getenv, remove, setenv, unsetenv
+from std.os import getenv, setenv, unsetenv
 from std.os.path import exists as path_exists
 from std.ffi import OwnedDLHandle, c_size_t
 from std.testing import TestSuite, assert_equal, assert_raises, assert_true
@@ -26,7 +26,6 @@ from objectstore.crypto import (
     to_hex,
 )
 from objectstore.azure import (
-    AzureClient,
     AzureConfig,
     BLOB_API_VERSION,
     parse_azure_uri,
@@ -82,7 +81,6 @@ from objectstore.path import (
     url_encode,
 )
 from objectstore.s3 import (
-    ListResult,
     MIN_PART_SIZE,
     S3Client,
     S3Config,

@@ -13,7 +13,6 @@ from std.sys import argv
 from objectstore.fileio import FileIOResolver
 from objectstore.http import curl_version, shim_abi
 from objectstore.local import local_input
-from objectstore.path import parse_uri
 from objectstore.s3 import S3Client, S3Config, split_s3_uri
 
 
