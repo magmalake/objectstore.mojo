@@ -28,17 +28,15 @@ from std.collections import Dict
 from .azure import AzureClient, AzureConfig, parse_azure_uri
 from .gcs import GcsClient, GcsConfig, split_gcs_uri
 from .http import BatchRequest, Header, HttpClient
-from .httpio import HttpInputFile, HttpOutputFile, http_delete
+from .httpio import HttpInputFile, HttpOutputFile
 from .local import LocalInputFile, LocalOutputFile, local_delete, local_list
-from .path import Uri, parse_uri
+from .path import parse_uri
 from .ranges import (
     ByteRange,
     CoalescedPlan,
-    DEFAULT_COALESCE_GAP,
     RangeReader,
     assemble,
     plan_ranges,
-    read_ranges_coalesced,
 )
 from .s3 import S3Client, S3Config, split_s3_uri
 

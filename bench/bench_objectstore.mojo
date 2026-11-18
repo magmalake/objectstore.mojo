@@ -19,7 +19,7 @@ from objectstore.crypto import (
     sha256_scalar,
 )
 from objectstore.fileio import FileIOResolver
-from objectstore.http import HttpClient, Header, curl_version
+from objectstore.http import curl_version
 from objectstore.httpio import HttpInputFile
 from objectstore.local import LocalInputFile, LocalOutputFile, local_delete
 from objectstore.ranges import ByteRange
