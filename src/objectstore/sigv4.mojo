@@ -114,7 +114,7 @@ struct AmzTime(Copyable, Movable):
         if amz_date.byte_length() < 8:
             raise Error("objectstore.sigv4: malformed X-Amz-Date " + amz_date)
         var b = amz_date.as_bytes()
-        var stamp = String(StringSlice(unsafe_from_utf8=Span(b)[0:8]))
+        var stamp = String(StringSpan(unsafe_from_utf8=Span(b)[0:8]))
         return Self(amz_date, stamp^)
 
 
@@ -214,7 +214,7 @@ def _collapse_spaces(value: String) -> String:
             continue
         prev_space = False
         out.append(c)
-    return String(StringSlice(unsafe_from_utf8=Span(out)))
+    return String(StringSpan(unsafe_from_utf8=Span(out)))
 
 
 def canonical_headers(

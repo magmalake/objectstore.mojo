@@ -358,7 +358,7 @@ struct FileIOResolver(Copyable, Movable):
             if location.startswith(self.from_prefixes[k]):
                 var b = location.as_bytes()
                 var rest = String(
-                    StringSlice(
+                    StringSpan(
                         unsafe_from_utf8=Span(b)[
                             self.from_prefixes[k].byte_length() : len(b)
                         ]
@@ -671,7 +671,7 @@ struct FileIOResolver(Copyable, Movable):
         var reqs = List[BatchRequest]()
         var what = List[String]()
         var first = List[Int]()
-        """For each file on S3, where its groups start in `reqs`."""
+        # For each file on S3, where its groups start in `reqs`.
         var client = Optional[S3Client](None)
         for k in range(len(locations)):
             out.append(List[List[UInt8]]())
@@ -709,7 +709,7 @@ struct FileIOResolver(Copyable, Movable):
 
     def read_text(self, location: String) raises -> String:
         var data = self.new_input(location).read_all()
-        return String(StringSlice(unsafe_from_utf8=Span(data)))
+        return String(StringSpan(unsafe_from_utf8=Span(data)))
 
     def exists(self, location: String) -> Bool:
         try:

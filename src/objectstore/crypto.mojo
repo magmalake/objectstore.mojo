@@ -744,7 +744,7 @@ def to_hex(data: Span[UInt8, _]) -> String:
     for k in range(len(data)):
         out.append(tbl[Int(data[k] >> 4)])
         out.append(tbl[Int(data[k] & 0xF)])
-    return String(StringSlice(unsafe_from_utf8=Span(out)))
+    return String(StringSpan(unsafe_from_utf8=Span(out)))
 
 
 def from_hex(s: String) raises -> List[UInt8]:

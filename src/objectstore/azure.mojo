@@ -56,19 +56,19 @@ def parse_azure_uri(location: String) raises -> AzureLocation:
         raise Error("azure: not an Azure location: " + location)
 
     var authority = u.bucket
-    var at = authority.find("@")
+    var at = authority.find("@").or_else(-1)
     var container = authority
     var host = String("")
     if at >= 0:
         var b = authority.as_bytes()
-        container = String(StringSlice(unsafe_from_utf8=Span(b)[0:at]))
-        host = String(StringSlice(unsafe_from_utf8=Span(b)[at + 1 : len(b)]))
+        container = String(StringSpan(unsafe_from_utf8=Span(b)[0:at]))
+        host = String(StringSpan(unsafe_from_utf8=Span(b)[at + 1 : len(b)]))
     var account = String("")
     if host != "":
-        var dot = host.find(".")
+        var dot = host.find(".").or_else(-1)
         if dot > 0:
             var hb = host.as_bytes()
-            account = String(StringSlice(unsafe_from_utf8=Span(hb)[0:dot]))
+            account = String(StringSpan(unsafe_from_utf8=Span(hb)[0:dot]))
         else:
             account = host
     return AzureLocation(account^, container^, u.key)
@@ -124,7 +124,7 @@ struct AzureConfig(Copyable, Movable):
             while e.endswith("/"):
                 var b = e.as_bytes()
                 var trimmed = String(
-                    StringSlice(unsafe_from_utf8=Span(b)[0 : len(b) - 1])
+                    StringSpan(unsafe_from_utf8=Span(b)[0 : len(b) - 1])
                 )
                 e = trimmed^
             return e^

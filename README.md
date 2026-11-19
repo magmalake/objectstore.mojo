@@ -39,7 +39,7 @@ That resolves the tin from [mojoshelf](https://mojoshelf.org) and adds it — al
 ## Why libcurl
 
 Phase 2 of this stack established that **no Mojo HTTP client resolves from
-conda** on either toolchain this repo supports:
+conda**:
 
 ```
 floki          -> No candidates were found
@@ -563,16 +563,19 @@ and tears them down:
 MinIO rather than moto because **moto does not verify signatures**, which is the
 only thing worth testing there. The runner looks for `$MINIO_BINARY`, then
 `build/minio`, then `minio` on `PATH`, then `moto_server`, and skips the S3
-tests with a printed reason if none is there. CI fetches the MinIO binary in a
-workflow step, so those tests run on all four legs. The only credentials
-anywhere are MinIO's well-known defaults, reaching a server on `127.0.0.1`.
+tests with a printed reason if none is there. MinIO comes from the
+`minio-server` dependency, so those tests run on every CI leg. The only
+credentials anywhere are MinIO's well-known defaults, reaching a server on
+`127.0.0.1`.
 
 ## Consuming this tin
 
-Sibling magmalake tins are consumed **by source path**, not as packages: the
-`pixi-build-mojo` backend emits a precompiled artifact built with mojo-compiler
-1.1.0 and the nightly compiler rejects it outright, so a package dependency
-cannot satisfy both environments.
+Sibling magmalake tins are consumed **by source path**, not as packages. The
+`pixi-build-mojo` backend emits a precompiled artifact that loads only in the
+compiler that built it; magmalake tins all build with one pinned Mojo nightly,
+`mojo-compiler ==1.3.0.dev2026111805`, and a workspace that consumes the
+package needs that same pin. The source works with any compiler it compiles
+on.
 
 ```
 mojo build my.mojo -I ../objectstore.mojo/src

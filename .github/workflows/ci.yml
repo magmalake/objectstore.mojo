@@ -13,8 +13,8 @@ on:
 
 jobs:
   # A release PR (only versions, CHANGELOG.md, revs and locks change; see
-  # tools/release_only.py in magmalake/.github) skips the macOS, nightly and
-  # extra jobs below and runs a consumer build of the PR head instead. Every
+  # tools/release_only.py in magmalake/.github) skips the macOS and extra
+  # jobs below and runs a consumer build of the PR head instead. Every
   # other PR runs everything. The verdict is its own fast job because the jobs
   # below wait for it; the builds are the next one.
   release:
@@ -35,20 +35,20 @@ jobs:
       pull-requests: read
     with:
       # The test legs below are skipped on release PRs; the unit tests run
-      # here instead, in the stable environment a consumer gets.
+      # here instead, in the environment a consumer gets.
       task: test
-      env: stable
+      env: default
+      mojo-compiler: "==1.3.0.dev2026111805"
 
   test:
     needs: release
     if: ${{ !cancelled() && needs.release.outputs.release_only != 'true' }}
-    name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-        env: [default, stable]
     steps:
       - uses: actions/checkout@v4
 
@@ -62,24 +62,23 @@ jobs:
           # Pinned: the committed lock file is written by 0.78.0, and an
           # unpinned pixi rejects it as not up-to-date with the workspace.
           pixi-version: v0.78.0
-          environments: ${{ matrix.env }}
 
       - name: Unit tests and CLI build
-        run: pixi run -e ${{ matrix.env }} check
+        run: pixi run check
 
       # The prototype backend over Mosaad-M/requests (objectstore#24): the
       # same suite, through the same servers, with libcurl out of the path.
       - name: Tests on the requests backend
-        run: pixi run -e ${{ matrix.env }} test-requests
+        run: pixi run test-requests
 
       # Through `pixi run`, with $CONDA_PREFIX set, and then from the plain
       # shell, where the shim is found through the binary's rpath.
       - name: CLI smoke
         run: |
-          pixi run -e ${{ matrix.env }} ./build/objectstore-mojo version
-          pixi run -e ${{ matrix.env }} ./build/objectstore-mojo stat file://$PWD/LICENSE
-          pixi run -e ${{ matrix.env }} ./build/objectstore-mojo head file://$PWD/NOTICE 40
-          pixi run -e ${{ matrix.env }} ./build/objectstore-mojo ls file://$PWD/shim
+          pixi run ./build/objectstore-mojo version
+          pixi run ./build/objectstore-mojo stat file://$PWD/LICENSE
+          pixi run ./build/objectstore-mojo head file://$PWD/NOTICE 40
+          pixi run ./build/objectstore-mojo ls file://$PWD/shim
           env -u CONDA_PREFIX ./build/objectstore-mojo version
           env -u CONDA_PREFIX ./build/objectstore-mojo stat file://$PWD/LICENSE
 

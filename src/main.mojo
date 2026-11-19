@@ -36,7 +36,7 @@ AWS_SESSION_TOKEN / AWS_REGION / AWS_ENDPOINT_URL_S3."""
 
 
 def _as_text(data: List[UInt8]) -> String:
-    return String(StringSlice(unsafe_from_utf8=Span(data)))
+    return String(StringSpan(unsafe_from_utf8=Span(data)))
 
 
 def main() raises:
