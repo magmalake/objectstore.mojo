@@ -227,7 +227,7 @@ def _request(
             unsafe_from_address=body_addr
         )
         body = String(
-            StringSlice(
+            StringSpan(
                 unsafe_from_utf8=Span[UInt8, ImmUntrackedOrigin](
                     unsafe_ptr=p, length=body_len
                 )
@@ -382,16 +382,16 @@ def _iso8601_epoch(s: String) -> Int:
 def _json_field(doc: String, key: String) -> String:
     """The string value of `"key": "..."` in a flat JSON object (IMDS's
     credential document), or `""`."""
-    var at = doc.find('"' + key + '"')
+    var at = doc.find('"' + key + '"').or_else(-1)
     if at < 0:
         return String()
-    var colon = doc.find(":", at)
+    var colon = doc.find(":", at).or_else(-1)
     if colon < 0:
         return String()
-    var q1 = doc.find('"', colon)
+    var q1 = doc.find('"', colon).or_else(-1)
     if q1 < 0:
         return String()
-    var q2 = doc.find('"', q1 + 1)
+    var q2 = doc.find('"', q1 + 1).or_else(-1)
     if q2 < 0:
         return String()
     return String(doc[byte = q1 + 1 : q2])

@@ -1,4 +1,4 @@
-"""libcurl vs the requests backend (objectstore#24), on the same URLs.
+"""`libcurl` vs the requests backend (objectstore#24), on the same URLs.
 
     BACKEND=curl|requests URL=<object url> MODE=<mode> ./bench-http-backends
 
@@ -102,7 +102,7 @@ def main() raises:
     # A one-byte range rather than a HEAD: a presigned URL is signed for GET.
     var probe = c.get(url, List[Header](), 0, 0)
     var cr = probe.header("Content-Range")
-    var slash = cr.find("/")
+    var slash = cr.find("/").or_else(-1)
     if probe.status != 206 or slash < 0:
         raise Error(
             "no Content-Range from " + url + ": " + String(probe.status)

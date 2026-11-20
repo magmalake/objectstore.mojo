@@ -34,7 +34,7 @@ def _substr(s: String, start: Int, end: Int) -> String:
         j = len(b)
     if i >= j:
         return String("")
-    return String(StringSlice(unsafe_from_utf8=Span(b)[i:j]))
+    return String(StringSpan(unsafe_from_utf8=Span(b)[i:j]))
 
 
 struct Uri(Copyable, Movable, Writable):
@@ -107,7 +107,7 @@ struct Uri(Copyable, Movable, Writable):
 
 
 def parse_uri(location: String) raises -> Uri:
-    var sep = location.find("://")
+    var sep = location.find("://").or_else(-1)
     if sep < 0:
         # A bare path. Anything with a colon but no `://` (a Windows drive, a
         # stray `mailto:`) is still treated as a path: this stack only ever
@@ -120,12 +120,12 @@ def parse_uri(location: String) raises -> Uri:
     var scheme = _ascii_lower(_substr(location, 0, sep))
     var rest = _substr(location, sep + 3, location.byte_length())
     var query = String("")
-    var q = rest.find("?")
+    var q = rest.find("?").or_else(-1)
     if q >= 0:
         query = _substr(rest, q + 1, rest.byte_length())
         rest = _substr(rest, 0, q)
 
-    var slash = rest.find("/")
+    var slash = rest.find("/").or_else(-1)
     var bucket = rest
     var key = String("")
     if slash >= 0:
@@ -149,7 +149,7 @@ def _ascii_lower(s: String) -> String:
         if c >= 65 and c <= 90:
             c += 32
         out.append(c)
-    return String(StringSlice(unsafe_from_utf8=Span(out)))
+    return String(StringSpan(unsafe_from_utf8=Span(out)))
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ def _ascii_lower(s: String) -> String:
 
 def join(base: String, child: String) -> String:
     """Joins a location with a relative child. An absolute `child` wins."""
-    if child.startswith("/") or child.find("://") >= 0:
+    if child.startswith("/") or "://" in child:
         return child
     if base == "":
         return child
@@ -170,7 +170,7 @@ def join(base: String, child: String) -> String:
 
 def basename(location: String) -> String:
     var stripped = _strip_query(location)
-    var i = stripped.rfind("/")
+    var i = stripped.rfind("/").or_else(-1)
     if i < 0:
         return stripped
     return _substr(stripped, i + 1, stripped.byte_length())
@@ -183,14 +183,14 @@ def parent(location: String) -> String:
     no slash has no parent and yields `""`.
     """
     var stripped = _strip_query(location)
-    var sep = stripped.find("://")
+    var sep = stripped.find("://").or_else(-1)
     var start = 0
     if sep >= 0:
         start = sep + 3
-        var s2 = stripped.find("/", start)
+        var s2 = stripped.find("/", start).or_else(-1)
         if s2 < 0:
             return stripped
-    var i = stripped.rfind("/")
+    var i = stripped.rfind("/").or_else(-1)
     if i < 0:
         return String("")
     if sep >= 0 and i < start:
@@ -201,7 +201,7 @@ def parent(location: String) -> String:
 
 
 def _strip_query(location: String) -> String:
-    var q = location.find("?")
+    var q = location.find("?").or_else(-1)
     if q < 0:
         return location
     return _substr(location, 0, q)
@@ -218,7 +218,7 @@ def strip_scheme(location: String) -> String:
         if rest.startswith("/"):
             return rest
         # `file://host/path` — drop the host, keep an absolute path.
-        var slash = rest.find("/")
+        var slash = rest.find("/").or_else(-1)
         if slash < 0:
             return String("/")
         return _substr(rest, slash, rest.byte_length())
@@ -248,7 +248,7 @@ def url_encode(s: String, encode_slash: Bool = True) -> String:
             or c == 126
         )
         if unreserved or (c == 47 and not encode_slash):
-            out += String(StringSlice(unsafe_from_utf8=Span(b)[k : k + 1]))
+            out += String(StringSpan(unsafe_from_utf8=Span(b)[k : k + 1]))
         else:
             out += "%"
             out += String(_HEXUP[byte=Int(c >> 4)])

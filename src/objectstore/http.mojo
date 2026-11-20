@@ -137,6 +137,12 @@ def install_backend(var backend: HttpBackend) raises:
 
 
 def _backend() raises -> ref[MutUntrackedOrigin] Optional[HttpBackend]:
+    # Works around a crash in Mojo 1.3.0.dev2026111805: a program whose first
+    # use of `Optional[HttpBackend]` comes before any use of
+    # `List[Optional[Response]]` (the return type of `BatchFn`) segfaults the
+    # compiler. Naming the list here first keeps every importer building. An
+    # empty List allocates nothing.
+    _ = List[Optional[Response]]()
     return _BACKEND.get_or_create_ptr()[].backend
 
 
@@ -335,7 +341,7 @@ def _instance_credentials(imm lib: OwnedDLHandle) raises -> String:
     if n <= 0:
         return String()
     buf.resize(n, 0)
-    return String(StringSlice(unsafe_from_utf8=Span(buf)))
+    return String(StringSpan(unsafe_from_utf8=Span(buf)))
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +368,7 @@ def _ascii_lower(s: String) -> String:
         if c >= 65 and c <= 90:
             c += 32
         out.append(c)
-    return String(StringSlice(unsafe_from_utf8=Span(out)))
+    return String(StringSpan(unsafe_from_utf8=Span(out)))
 
 
 def _trim(s: String) -> String:
@@ -377,7 +383,7 @@ def _trim(s: String) -> String:
         j -= 1
     if i >= j:
         return String("")
-    return String(StringSlice(unsafe_from_utf8=Span(b)[i:j]))
+    return String(StringSpan(unsafe_from_utf8=Span(b)[i:j]))
 
 
 def header_blob(headers: List[Header]) -> String:
@@ -477,10 +483,10 @@ def s3_retryable_error(body: Span[UInt8, _]) -> Bool:
     var n = len(body)
     if n > 1024:
         n = 1024
-    var head = String(StringSlice(unsafe_from_utf8=Span(body)[0:n]))
-    if head.find("<Code>SlowDown</Code>") >= 0:
+    var head = String(StringSpan(unsafe_from_utf8=Span(body)[0:n]))
+    if "<Code>SlowDown</Code>" in head:
         return True
-    return head.find("<Code>RequestTimeout</Code>") >= 0
+    return "<Code>RequestTimeout</Code>" in head
 
 
 def backoff_delay_ms(policy: RetryPolicy, attempt: Int) -> Int:
@@ -545,7 +551,7 @@ struct Response(Copyable, Movable):
         return False
 
     def text(self) -> String:
-        return String(StringSlice(unsafe_from_utf8=Span(self.body)))
+        return String(StringSpan(unsafe_from_utf8=Span(self.body)))
 
     def body_excerpt(self, limit: Int = 256) -> String:
         """The first `limit` bytes of the body, for error messages.
@@ -557,7 +563,7 @@ struct Response(Copyable, Movable):
         var n = len(self.body)
         if n > limit:
             n = limit
-        var s = String(StringSlice(unsafe_from_utf8=Span(self.body)[0:n]))
+        var s = String(StringSpan(unsafe_from_utf8=Span(self.body)[0:n]))
         if len(self.body) > limit:
             s += "…"
         return s^
@@ -588,20 +594,20 @@ def parse_headers(raw: String) -> List[Header]:
         var j = i
         while j < n and b[j] != 10:
             j += 1
-        var line = _trim(String(StringSlice(unsafe_from_utf8=Span(b)[i:j])))
+        var line = _trim(String(StringSpan(unsafe_from_utf8=Span(b)[i:j])))
         i = j + 1
         if line == "":
             continue
         if line.startswith("HTTP/"):
             out = List[Header]()
             continue
-        var c = line.find(":")
+        var c = line.find(":").or_else(-1)
         if c < 0:
             continue
         var lb = line.as_bytes()
-        var name = _trim(String(StringSlice(unsafe_from_utf8=Span(lb)[0:c])))
+        var name = _trim(String(StringSpan(unsafe_from_utf8=Span(lb)[0:c])))
         var value = _trim(
-            String(StringSlice(unsafe_from_utf8=Span(lb)[c + 1 : len(lb)]))
+            String(StringSpan(unsafe_from_utf8=Span(lb)[c + 1 : len(lb)]))
         )
         out.append(Header(name^, value^))
     return out^

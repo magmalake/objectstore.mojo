@@ -14,13 +14,13 @@ from .path import parse_uri
 
 
 def _dirname(path: String) -> String:
-    var i = path.rfind("/")
+    var i = path.rfind("/").or_else(-1)
     if i < 0:
         return String(".")
     if i == 0:
         return String("/")
     var b = path.as_bytes()
-    return String(StringSlice(unsafe_from_utf8=Span(b)[0:i]))
+    return String(StringSpan(unsafe_from_utf8=Span(b)[0:i]))
 
 
 @fieldwise_init

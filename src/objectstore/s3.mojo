@@ -275,18 +275,18 @@ def _substr(s: String, start: Int, end: Int) -> String:
         j = len(b)
     if i >= j:
         return String("")
-    return String(StringSlice(unsafe_from_utf8=Span(b)[i:j]))
+    return String(StringSpan(unsafe_from_utf8=Span(b)[i:j]))
 
 
 def xml_unescape(s: String) -> String:
-    if s.find("&") < 0:
+    if "&" not in s:
         return s
     var out = String("")
     var b = s.as_bytes()
     var i = 0
     while i < len(b):
         if b[i] == 38:  # '&'
-            var semi = s.find(";", i)
+            var semi = s.find(";", i).or_else(-1)
             if semi > i and semi - i <= 8:
                 var name = _substr(s, i + 1, semi)
                 match name:
@@ -304,7 +304,7 @@ def xml_unescape(s: String) -> String:
                         out += _substr(s, i, semi + 1)
                 i = semi + 1
                 continue
-        out += String(StringSlice(unsafe_from_utf8=Span(b)[i : i + 1]))
+        out += String(StringSpan(unsafe_from_utf8=Span(b)[i : i + 1]))
         i += 1
     return out^
 
@@ -327,14 +327,14 @@ def xml_escape(s: String) -> String:
             case 62:  # >
                 out += "&gt;"
             case _:
-                out += String(StringSlice(unsafe_from_utf8=Span(b)[k : k + 1]))
+                out += String(StringSpan(unsafe_from_utf8=Span(b)[k : k + 1]))
     return out^
 
 
 def xml_element(body: String, tag: String, start: Int = 0) -> Int:
     """Byte offset of `<tag>`'s content, or -1. Feeds `xml_text`."""
     var open_tag = String("<") + tag + ">"
-    var at = body.find(open_tag, start)
+    var at = body.find(open_tag, start).or_else(-1)
     if at < 0:
         return -1
     return at + open_tag.byte_length()
@@ -345,7 +345,7 @@ def xml_text(body: String, tag: String, start: Int = 0) -> String:
     var content = xml_element(body, tag, start)
     if content < 0:
         return String("")
-    var close = body.find(String("</") + tag + ">", content)
+    var close = body.find(String("</") + tag + ">", content).or_else(-1)
     if close < 0:
         return String("")
     return xml_unescape(_substr(body, content, close))
@@ -358,11 +358,11 @@ def xml_blocks(body: String, tag: String) -> List[String]:
     var close_tag = String("</") + tag + ">"
     var i = 0
     while True:
-        var at = body.find(open_tag, i)
+        var at = body.find(open_tag, i).or_else(-1)
         if at < 0:
             break
         var content = at + open_tag.byte_length()
-        var close = body.find(close_tag, content)
+        var close = body.find(close_tag, content).or_else(-1)
         if close < 0:
             break
         out.append(_substr(body, content, close))
@@ -449,11 +449,11 @@ struct S3Client(Copyable, Movable):
         var u = self.config.endpoint
         var scheme = String("https")
         var rest = u
-        var sep = u.find("://")
+        var sep = u.find("://").or_else(-1)
         if sep >= 0:
             scheme = _substr(u, 0, sep)
             rest = _substr(u, sep + 3, u.byte_length())
-        var slash = rest.find("/")
+        var slash = rest.find("/").or_else(-1)
         if slash >= 0:
             rest = _substr(rest, 0, slash)
         return Tuple(scheme^, rest^)
@@ -838,7 +838,7 @@ struct S3Client(Copyable, Movable):
         # S3 answers 200 and *then* streams an error, because the completion
         # can take minutes and the status line has already gone out.
         var text = r.text()
-        if text.find("<Error>") >= 0 or text.find("<Code>") >= 0:
+        if "<Error>" in text or "<Code>" in text:
             raise Error(
                 "s3: CompleteMultipartUpload "
                 + bucket

@@ -7,7 +7,15 @@ description = "Storage and HTTP layer for magmalake: FileIO over local files, HT
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
 
+# One toolchain: the tin, its tests and every consumer use the same Mojo
+# nightly. A precompiled Mojo package (.mojoc) loads only in the compiler
+# version that built it, so the pin is exact here and in [package] below, and
+# it moves across all magmalake tins together. `mojo` rather than
+# `mojo-compiler` because the fmt and format-check tasks need `mojo format`,
+# which only the bigger package ships; it pins mojo-compiler to the same
+# version.
 [dependencies]
+mojo = "==1.3.0.dev2026111805"
 # libcurl brings TLS + a CA bundle; the C shim (shim/) wraps it in a
 # non-variadic surface and installs lib/libobjectstoremojo.so into the env.
 libcurl = ">=8,<9"
@@ -49,10 +57,11 @@ check = { depends-on = ["test", "cli"] }
 cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/objectstore-mojo" }
 bench = { cmd = "bash bench/run_bench.sh" }
 fmt = { cmd = "mojo format src tests bench" }
-# `mojo format` has no check mode in 1.1.0 — it rejects `--check`, and there is
-# none among the hidden options either — so the check is: format, then assert the
-# tree did not move. It rewrites the files as a side effect, which is what CI
-# wants and is harmless locally; run it with your own work committed or stashed.
+# `mojo format` has no check mode — 1.3.0.dev2026111805 rejects `--check`, and
+# there is none among the hidden options either — so the check is: format,
+# then assert the tree did not move. It rewrites the files as a side effect,
+# which is what CI wants and is harmless locally; run it with your own work
+# committed or stashed.
 format-check = { cmd = "mojo format src tests bench && git diff --exit-code -- src tests bench" }
 
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
@@ -70,22 +79,11 @@ path = "src/objectstore"
 name = "objectstore"
 
 [package.host-dependencies]
-mojo-compiler = "==1.2.0"
+mojo-compiler = "==1.3.0.dev2026111805"
 
 [package.build-dependencies]
-mojo-compiler = "==1.2.0"
+mojo-compiler = "==1.3.0.dev2026111805"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.2.0,<2"
+mojo-compiler = "==1.3.0.dev2026111805"
 objectstore-shim = { path = "shim" }
-
-# ── stable / nightly toolchain matrix (see CI) ──────────────────────────────
-[feature.nightly.dependencies]
-modular = ">=26.8.0.dev2026102305,<28"
-
-[feature.stable.dependencies]
-mojo-compiler = "==1.2.0"
-
-[environments]
-default = ["nightly"]
-stable = ["stable"]

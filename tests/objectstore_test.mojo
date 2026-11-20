@@ -599,7 +599,7 @@ def test_http_head_and_errors() raises:
     var e500 = c.get(base + "/status/500")
     assert_equal(e500.status, 500)
     assert_true(not e500.ok())
-    assert_true(e500.body_excerpt().find("status 500") >= 0)
+    assert_true("status 500" in e500.body_excerpt())
     with assert_raises():
         e500.raise_for_status("boom")
     assert_equal(c.get(base + "/status/403").status, 403)
@@ -617,16 +617,16 @@ def test_http_verbs_and_custom_headers() raises:
     var body = _bytes(String("payload-bytes"))
     var posted = c.post(base + "/echo", Span(body), hs)
     assert_equal(posted.status, 200)
-    assert_true(posted.text().find("method=POST") >= 0)
-    assert_true(posted.text().find("x-test=marker") >= 0)
-    assert_true(posted.text().find("body-len=13") >= 0)
+    assert_true("method=POST" in posted.text())
+    assert_true("x-test=marker" in posted.text())
+    assert_true("body-len=13" in posted.text())
 
     var put = c.put(base + "/echo", Span(body), hs)
-    assert_true(put.text().find("method=PUT") >= 0)
-    assert_true(put.text().find("body=payload-bytes") >= 0)
+    assert_true("method=PUT" in put.text())
+    assert_true("body=payload-bytes" in put.text())
 
     var deleted = c.delete(base + "/echo")
-    assert_true(deleted.text().find("method=DELETE") >= 0)
+    assert_true("method=DELETE" in deleted.text())
 
     # A real PUT/DELETE lifecycle against a file resource.
     var created = c.put(base + "/files/created.txt", Span(body))
@@ -642,7 +642,7 @@ def _received_headers(report: String) -> Dict[String, String]:
     var out = Dict[String, String]()
     for line in report.split("\n"):
         var l = String(line)
-        var colon = l.find(": ")
+        var colon = l.find(": ").or_else(-1)
         if colon <= 0:
             continue
         out[String(l[byte=0:colon])] = String(l[byte = colon + 2 :])
@@ -669,8 +669,8 @@ def test_http_body_requests_add_no_content_type() raises:
         var m = String(method)
         var r = c.request(m, base + "/headers/x", none, Span(body))
         assert_equal(r.status, 200)
-        assert_true(r.text().find("method=" + m) >= 0)
-        assert_true(r.text().find("body-len=12") >= 0)
+        assert_true(("method=" + m) in r.text())
+        assert_true("body-len=12" in r.text())
         var got = _received_headers(r.text())
         assert_true(
             "content-type" not in got,
@@ -721,12 +721,12 @@ def test_http_input_file() raises:
 
     var mid = f.read_range(500, 10)
     assert_equal(len(mid), 10)
-    assert_equal(String(StringSlice(unsafe_from_utf8=Span(mid))), "0123456789")
+    assert_equal(String(StringSpan(unsafe_from_utf8=Span(mid))), "0123456789")
 
     # Suffix range: the last 5 bytes of 100 000 digits.
     var tail = f.read_range(-5, 5)
     assert_equal(len(tail), 5)
-    assert_equal(String(StringSlice(unsafe_from_utf8=Span(tail))), "56789")
+    assert_equal(String(StringSpan(unsafe_from_utf8=Span(tail))), "56789")
 
     assert_true(not HttpInputFile(base + "/files/nope.txt").exists())
 
@@ -756,7 +756,7 @@ def test_http_connection_reuse() raises:
     var stats = pool_stats()
     assert_equal(stats[0], 21)
     assert_true(stats[1] <= 1)
-    assert_true(c.get(base + "/ports").text().find("count=1") >= 0)
+    assert_true("count=1" in c.get(base + "/ports").text())
 
 
 def test_http_dedicated_pool() raises:
@@ -790,7 +790,7 @@ def _digits(offset: Int, length: Int) -> String:
     var out = List[UInt8](capacity=length)
     for i in range(offset, offset + length):
         out.append(UInt8(48 + i % 10))
-    return String(StringSlice(unsafe_from_utf8=Span(out)))
+    return String(StringSpan(unsafe_from_utf8=Span(out)))
 
 
 def test_plan_ranges() raises:
@@ -869,7 +869,7 @@ def test_http_read_ranges_coalesce() raises:
     assert_equal(len(got), 6)
     for k in range(len(want)):
         assert_equal(
-            String(StringSlice(unsafe_from_utf8=Span(got[k]))),
+            String(StringSpan(unsafe_from_utf8=Span(got[k]))),
             _digits(want[k].offset, want[k].length),
         )
     if shim_abi() >= 2:
@@ -882,7 +882,7 @@ def test_http_read_ranges_coalesce() raises:
     assert_equal(len(split), 6)
     for k in range(len(want)):
         assert_equal(
-            String(StringSlice(unsafe_from_utf8=Span(split[k]))),
+            String(StringSpan(unsafe_from_utf8=Span(split[k]))),
             _digits(want[k].offset, want[k].length),
         )
     if shim_abi() >= 2:
@@ -918,7 +918,7 @@ def test_http_request_many() raises:
     for k in range(20):
         assert_equal(got[k].status, 206)
         assert_equal(
-            String(StringSlice(unsafe_from_utf8=Span(got[k].body))),
+            String(StringSpan(unsafe_from_utf8=Span(got[k].body))),
             _digits(k * 4000, 100),
         )
     assert_equal(got[20].status, 404)
@@ -1000,12 +1000,10 @@ def _attempts(base: String, key: String) raises -> Int:
     var c = HttpClient()
     var r = c.get(base + "/attempts?key=" + key)
     var text = r.text()
-    var at = text.find("attempts=")
-    var end = text.find("\n", at)
+    var at = text.find("attempts=").or_else(-1)
+    var end = text.find("\n", at).or_else(-1)
     return Int(
-        String(
-            StringSlice(unsafe_from_utf8=Span(text.as_bytes())[at + 9 : end])
-        )
+        String(StringSpan(unsafe_from_utf8=Span(text.as_bytes())[at + 9 : end]))
     )
 
 
@@ -1076,7 +1074,7 @@ def test_retry_transient_failures() raises:
 
     var r = c.get(base + "/flaky/503/2?key=t503")
     assert_equal(r.status, 200)
-    assert_true(r.text().find("attempts=3") >= 0)
+    assert_true("attempts=3" in r.text())
     assert_equal(_attempts(base, String("t503")), 3)
 
     var r429 = c.get(base + "/flaky/429/1?key=t429")
@@ -1134,7 +1132,7 @@ def test_retry_only_when_repeatable() raises:
     hs.append(Header("Idempotency-Key", "commit-42"))
     var keyed = c.post(base + "/flaky/503/2?key=post-key", Span(body), hs)
     assert_equal(keyed.status, 200)
-    assert_true(keyed.text().find("idem=commit-42") >= 0)
+    assert_true("idem=commit-42" in keyed.text())
     assert_equal(_attempts(base, String("post-key")), 3)
 
     # PUT is idempotent by definition, so it needs no header.
@@ -1417,7 +1415,7 @@ def test_resolver_local_io() raises:
     assert_equal(io.read_text(loc), "resolver round trip")
     assert_equal(io.new_input(loc).length(), 19)
     var mid = io.read_range(loc, 9, 5)
-    assert_equal(String(StringSlice(unsafe_from_utf8=Span(mid))), "round")
+    assert_equal(String(StringSpan(unsafe_from_utf8=Span(mid))), "round")
     io.delete(loc)
     assert_true(not io.exists(loc))
 
@@ -1528,9 +1526,9 @@ def test_azure_sas_urls_and_headers() raises:
     # The SAS query already begins the query string, so a list request has to
     # append with `&`, not `?`.
     assert_true(
-        c.list_url(String("cont"), String("db/"), String("")).find(
-            "?sv=2021-12-02&sig=SIGNATURE&restype=container&comp=list"
-        )
+        c.list_url(String("cont"), String("db/"), String(""))
+        .find("?sv=2021-12-02&sig=SIGNATURE&restype=container&comp=list")
+        .or_else(-1)
         > 0
     )
     var h = c.headers()
@@ -1549,12 +1547,14 @@ def test_azure_sas_urls_and_headers() raises:
         AzureConfig.from_properties(props, String("acct"))
         .url_for(String("c"), String("k"))
         .find("SIGNATURE")
+        .or_else(-1)
         > 0
     )
     assert_true(
         AzureConfig.from_properties(props, String("other"))
         .url_for(String("c"), String("k"))
         .find("GENERIC")
+        .or_else(-1)
         > 0
     )
 
@@ -1603,10 +1603,10 @@ def _assert_only_signed_headers(report: String, what: String) raises:
     var got = _received_headers(report)
     assert_true("authorization" in got, what + ": unsigned")
     var auth = got["authorization"]
-    var at = auth.find("SignedHeaders=")
+    var at = auth.find("SignedHeaders=").or_else(-1)
     assert_true(at >= 0, what + ": " + auth)
     var tail = String(auth[byte = at + 14 :])
-    var comma = tail.find(",")
+    var comma = tail.find(",").or_else(-1)
     var names = String(tail[byte=0:comma]) if comma >= 0 else tail
     var signed = Dict[String, Bool]()
     for name in names.split(";"):
@@ -1649,7 +1649,7 @@ def test_s3_sends_only_signed_headers() raises:
     etags.append(String('"etag-1"'))
     c.complete_multipart_upload(bucket, String("k.parquet"), "up-1", etags)
     var last = HttpClient().get(base + "/headers-last").text()
-    assert_true(last.find("method=POST") >= 0, last)
+    assert_true("method=POST" in last, last)
     _assert_only_signed_headers(last, "CompleteMultipartUpload")
     # Typed by the client itself, so an older shim that still adds curl's
     # form default cannot reintroduce the bug.
@@ -1758,7 +1758,7 @@ def test_s3_keys_needing_encoding() raises:
     var body = _bytes(String("encoded-key"))
     c.put_object(bucket, key, Span(body))
     assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(c.get_object(bucket, key)))),
+        String(StringSpan(unsafe_from_utf8=Span(c.get_object(bucket, key)))),
         "encoded-key",
     )
     c.delete_object(bucket, key)
@@ -1855,7 +1855,7 @@ def test_s3_multipart_upload() raises:
     # A multipart object's ETag is a digest of the part digests plus `-<parts>`,
     # which is how the server itself says the upload really was multipart.
     var etag = c.head_object(bucket, key).header("ETag")
-    assert_true(etag.find("-3") > 0)
+    assert_true(etag.find("-3").or_else(-1) > 0)
     # Ranges still address the assembled object, not a part.
     var mid = c.get_object(bucket, key, 9 * 1024 * 1024, 9 * 1024 * 1024 + 15)
     assert_equal(len(mid), 16)
@@ -1880,7 +1880,11 @@ def test_s3_multipart_upload() raises:
         sha256_hex(Span(big)),
     )
     assert_true(
-        big_client.head_object(bucket, big_key).header("ETag").find("-8") > 0
+        big_client.head_object(bucket, big_key)
+        .header("ETag")
+        .find("-8")
+        .or_else(-1)
+        > 0
     )
     big_client.delete_object(bucket, big_key)
 
@@ -2034,7 +2038,7 @@ def test_s3_read_all_many() raises:
     assert_equal(len(got), 12)
     for k in range(12):
         assert_equal(
-            String(StringSlice(unsafe_from_utf8=Span(got[k]))),
+            String(StringSpan(unsafe_from_utf8=Span(got[k]))),
             String("manifest ", k),
         )
     if shim_abi() >= 4:
@@ -2107,7 +2111,7 @@ def test_s3_virtual_host_addressing() raises:
     var body = _bytes(String("virtual host addressing"))
     c.put_object(bucket, key, Span(body))
     assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(c.get_object(bucket, key)))),
+        String(StringSpan(unsafe_from_utf8=Span(c.get_object(bucket, key)))),
         "virtual host addressing",
     )
     c.delete_object(bucket, key)
@@ -2124,19 +2128,17 @@ def test_s3_presigned_url() raises:
     c.put_object(bucket, key, Span(body))
 
     var url = c.presign_get(bucket, key, 900)
-    assert_true(url.find("X-Amz-Signature=") > 0)
-    assert_true(url.find("X-Amz-Credential=") > 0)
+    assert_true(url.find("X-Amz-Signature=").or_else(-1) > 0)
+    assert_true(url.find("X-Amz-Credential=").or_else(-1) > 0)
 
     # The whole point: a client with no credentials at all can read it.
     var anon = HttpInputFile(url)
     assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(anon.read_all()))),
+        String(StringSpan(unsafe_from_utf8=Span(anon.read_all()))),
         "presigned payload",
     )
     var ranged = anon.read_range(0, 9)
-    assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(ranged))), "presigned"
-    )
+    assert_equal(String(StringSpan(unsafe_from_utf8=Span(ranged))), "presigned")
     c.delete_object(bucket, key)
 
 
@@ -2156,7 +2158,7 @@ def test_s3_via_resolver() raises:
     assert_true(io.exists(loc))
     assert_equal(io.read_text(loc), "resolver over s3")
     assert_equal(
-        String(StringSlice(unsafe_from_utf8=Span(io.read_range(loc, 9, 4)))),
+        String(StringSpan(unsafe_from_utf8=Span(io.read_range(loc, 9, 4)))),
         "over",
     )
     var listed = io.list(String("s3://") + _s3_bucket() + "/resolver/")
