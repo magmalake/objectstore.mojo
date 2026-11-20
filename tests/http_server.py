@@ -258,8 +258,20 @@ class Handler(BaseHTTPRequestHandler):
     do_GET = do_HEAD = do_PUT = do_POST = do_PATCH = do_DELETE = _serve
 
 
+class Server(ThreadingHTTPServer):
+    # socketserver listens with a backlog of 5. A batch opens up to 8 (or 16)
+    # connections at once, and when more arrive than the accept queue holds,
+    # macOS refuses some of them or resets them right after the handshake.
+    # The client retries those requests, so every response still arrives, but
+    # a reset connection was opened and counted, and its replacement is
+    # counted too: test_http_request_many then saw 9 or 10 connections from a
+    # batch that never had more than 8 open at once. A queue that holds a
+    # whole burst keeps every connection a request was sent on.
+    request_queue_size = 128
+
+
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = Server(("127.0.0.1", 0), Handler)
     print("http://127.0.0.1:%d" % server.server_address[1], flush=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
