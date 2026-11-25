@@ -573,7 +573,7 @@ credentials anywhere are MinIO's well-known defaults, reaching a server on
 Sibling magmalake tins are consumed **by source path**, not as packages. The
 `pixi-build-mojo` backend emits a precompiled artifact that loads only in the
 compiler that built it; magmalake tins all build with one pinned Mojo nightly,
-`mojo-compiler ==1.3.0.dev2026111805`, and a workspace that consumes the
+`mojo-compiler ==1.3.0.dev2026112505`, and a workspace that consumes the
 package needs that same pin. The source works with any compiler it compiles
 on.
 
